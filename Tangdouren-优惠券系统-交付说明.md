@@ -131,7 +131,7 @@ select column_name from information_schema.columns
 | 生产构建 | `npm run build` | 通过，`/dashboard/coupons`、`/api/admin/coupons`、`/api/admin/coupons/validate` 均已产出 |
 | ESLint | `npm run lint` | **基线就不可用**，见下 |
 | 真实数据库端到端 | `coupon_verify.py`（对 Supabase 测试项目） | **80 passed / 0 failed**，见 3.1 |
-| 匿名攻击复测 | `Tangdouren-匿名攻击复测脚本.py`（同一测试项目） | **15 passed / 0 failed**，见 3.1 |
+| 匿名攻击复测 | `~/Desktop/Projects/Tangdouren-工具/匿名攻击复测脚本.py`（同一测试项目） | **15 passed / 0 failed**，见 3.1 |
 
 覆盖到的 PRD 用例：
 * 计算：£13.99 用 £2 券 → £11.99；券额大于原价 → £0.00；£25.99 用 15% OFF → 优惠 £3.90、应收 £22.09；60 分钟订单拒绝时长券；时长券统一按半小时续时价抵扣。
