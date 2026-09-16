@@ -170,10 +170,10 @@ select column_name from information_schema.columns
 
 并发部分是真的两个线程同时发起 RPC（`threading.Barrier` 对齐起跑），不是串行模拟；数据库侧 `SELECT ... FOR UPDATE` + 部分唯一索引把抢券挡住了。
 
-验证脚本保留在 `~/Desktop/Projects/Tangdouren-优惠券系统-验证脚本.py`，改完代码可以重跑：
+验证脚本保留在 `~/Desktop/Projects/Tangdouren-工具/优惠券系统-验证脚本.py`，改完代码可以重跑：
 
 ```bash
-python3 ~/Desktop/Projects/Tangdouren-优惠券系统-验证脚本.py https://<ref>.supabase.co <secret_key>
+python3 ~/Desktop/Projects/Tangdouren-工具/优惠券系统-验证脚本.py https://<ref>.supabase.co <secret_key>
 ```
 
 **验证中发现的一个操作要点**：`timer_sessions.coupon_id → coupons` 和 `coupons.redeemed_session_id → timer_sessions` 这两条外键都是 `ON DELETE RESTRICT`，**互相锁死**。也就是说券一旦被核销，订单和券**谁都删不掉**，必须先撤销结算（`unsettle` 在同一事务里把两侧引用一起清空）才能删除。这是 PRD 设计的直接结果、不是缺陷，但店员和运维需要知道这个操作顺序。
