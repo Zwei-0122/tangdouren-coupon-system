@@ -59,6 +59,8 @@ ALTER TABLE blocked_time_slots ENABLE ROW LEVEL SECURITY;
 
 三者都是纯增量、向前兼容的变更，可在现有 Supabase 项目直接执行，执行方法见交付说明第 2 节。
 
+**生产库执行前先备份**（Dashboard → Database → Backups）：这三个迁移都是建表、加列、加约束，执行本身不可回滚。
+
 **执行顺序：`015` 必须在 `013` 之后**（它依赖 `coupons` 表，CHECK 还会校验 `code_prefix` 与 `code` 开头一致）。**接手的人注意：不跑 `015` 就生成优惠券，会直接报缺列。**
 
 ## 产品行为上需要知道的四件事
