@@ -51,6 +51,10 @@ ALTER TABLE timer_sessions     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE blocked_time_slots ENABLE ROW LEVEL SECURITY;
 ```
 
+### Windows 提示
+
+`patches/*.patch` 里的通配符由 shell 展开。用 **Git Bash**（Git for Windows 自带）打开时，上面的命令原样可用；在 PowerShell 或 CMD 里若报 `fatal: could not open 'patches/*.patch' for reading`，改走方式二（bundle，一条 `git fetch`，不涉及通配符），或按文件名逐个应用四个补丁。
+
 ## 数据库迁移
 
 1. `supabase/migrations/013_coupons.sql`：优惠券表、约束、索引、RLS、结算核销与撤销两个事务函数
