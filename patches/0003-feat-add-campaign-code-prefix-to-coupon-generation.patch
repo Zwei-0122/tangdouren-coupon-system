@@ -1,0 +1,723 @@
+From acda6e41949eaeeac9ced141af1776485fd026c9 Mon Sep 17 00:00:00 2001
+From: Zwei-0122 <325088970+Zwei-0122@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 02:11:09 +0100
+Subject: [PATCH 3/4] feat: add campaign code prefix to coupon generation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 新增 coupons.code_prefix（迁移 015）：2-8 位大写字母数字，CHECK 同时校验与
+  code 的一致性（left(code, length(code_prefix)) = code_prefix），防漏填；存量券
+  由 DEFAULT 'TD' 覆盖回填，无需 UPDATE
+- 随机后缀由 8 位下调为 5 位。批内重复本就由 Set 去重排除，唯一撞码来源是撞上
+  库里同前缀旧券；按该公式实测，同前缀存量 5000 张时 5 位整批失败率 0.037%，
+  4 位则达 74.8%，故取 5
+- lib/coupon：新增 normalizeCodePrefix / isValidCodePrefix / codePrefixHints；
+  生成参数校验新增 codePrefix，留空回退 TD，填错（非字符串、非法字符、长度越界）
+  一律拒绝而非静默吞掉
+- GET /api/admin/coupons 新增 prefix 筛选与 usedPrefixes；后者走
+  coupon_prefix_usage()，因 PostgREST 在本项目禁用聚合，GROUP BY 需落在数据库，
+  且只授权 service_role，匿名经 PostgREST 调不到
+- 后台优惠券页：生成弹窗加前缀输入框 + 历史前缀快捷标签 + 非阻断提示，列表加
+  前缀筛选与展示，每行可「再生成一批」；导出 CSV 增加 code_prefix 列
+- 测试由 34 项增至 44 项（新增前缀规范/合法性/提示/回退 TD/长度上限用例）
+- 测试项目实测：端到端 80 项 + 匿名复测 15 项全部通过
+
+PRD v1.0 原定「不允许店员自定义优惠码」，本次按 PRD v1.1 改为前缀可自定义；
+后缀仍为系统随机，不做顺序号（递增数字可被枚举）。向后兼容：不填前缀时券码
+形状与旧版一致，仅后缀长度由 8 位变 5 位。
+---
+ app/(admin)/dashboard/coupons/page.tsx    | 140 +++++++++++++++++++++-
+ app/api/admin/coupons/route.ts            |  18 ++-
+ lib/coupon/code.ts                        |  15 ++-
+ lib/coupon/coupon.ts                      |  60 +++++++++-
+ supabase/migrations/015_coupon_prefix.sql |  57 +++++++++
+ tests/coupon.test.ts                      | 103 +++++++++++++++-
+ 6 files changed, 372 insertions(+), 21 deletions(-)
+ create mode 100644 supabase/migrations/015_coupon_prefix.sql
+
+diff --git a/app/(admin)/dashboard/coupons/page.tsx b/app/(admin)/dashboard/coupons/page.tsx
+index 4bc5b95..c1439cf 100644
+--- a/app/(admin)/dashboard/coupons/page.tsx
++++ b/app/(admin)/dashboard/coupons/page.tsx
+@@ -4,11 +4,16 @@ import { useCallback, useEffect, useState } from 'react'
+ import Link from 'next/link'
+ import Sidebar from '@/components/admin/Sidebar'
+ import {
++  COUPON_CODE_LENGTH,
+   COUPON_STATUS_LABELS,
++  MAX_CODE_PREFIX_LENGTH,
+   MAX_GENERATE_QUANTITY,
++  MIN_CODE_PREFIX_LENGTH,
+   TIME_COUPON_STEP_MINUTES,
++  codePrefixHints,
+   couponStatus,
+   describeDiscount,
++  isValidCodePrefix,
+   londonToday,
+   type CouponStatus,
+   type DiscountType,
+@@ -17,6 +22,7 @@ import {
+ interface Coupon {
+   coupon_id:           string
+   code:                string
++  code_prefix:         string
+   discount_type:       DiscountType
+   discount_value:      number
+   expires_at:          string | null
+@@ -27,6 +33,13 @@ interface Coupon {
+   created_at:          string
+ }
+ 
++/** 已用前缀（GET 里由 coupon_prefix_usage() 聚合返回） */
++interface UsedPrefix {
++  code_prefix:     string
++  uses:            number
++  last_created_at: string | null
++}
++
+ interface CouponStats {
+   total:     number
+   available: number
+@@ -71,6 +84,8 @@ export default function CouponsPage() {
+   const [totalPages, setTotal]  = useState(1)
+   const [total, setTotalRows]   = useState(0)
+   const [status, setStatus]     = useState<string>('all')
++  const [prefixFilter, setPrefixFilter] = useState('')
++  const [usedPrefixes, setUsedPrefixes] = useState<UsedPrefix[]>([])
+   const [searchInput, setSearchInput] = useState('')
+   const [search, setSearch]     = useState('')
+   const [copied, setCopied]     = useState('')
+@@ -83,6 +98,7 @@ export default function CouponsPage() {
+     permanent:     true,
+     expiresOn:     londonToday(),
+     quantity:      '1',
++    codePrefix:    '',
+   })
+   const [generating, setGenerating] = useState(false)
+   const [formError, setFormError]   = useState('')
+@@ -95,18 +111,21 @@ export default function CouponsPage() {
+       pageSize: String(PAGE_SIZE),
+       status,
+       search,
++      prefix:   prefixFilter,
+     })
+     const res  = await fetch(`/api/admin/coupons?${params.toString()}`)
+     const data = await res.json() as {
+-      coupons?: Coupon[]; stats?: CouponStats; totalPages?: number; total?: number; error?: string
++      coupons?: Coupon[]; stats?: CouponStats; totalPages?: number; total?: number
++      usedPrefixes?: UsedPrefix[]; error?: string
+     }
+     if (!res.ok) { alert(data.error ?? '读取优惠券失败'); setLoading(false); return }
+     setCoupons(data.coupons ?? [])
+     setStats(data.stats ?? { total: 0, available: 0, redeemed: 0, expired: 0 })
+     setTotal(data.totalPages ?? 1)
+     setTotalRows(data.total ?? 0)
++    setUsedPrefixes(data.usedPrefixes ?? [])
+     setLoading(false)
+-  }, [page, status, search])
++  }, [page, status, search, prefixFilter])
+ 
+   useEffect(() => { load() }, [load]) // eslint-disable-line react-hooks/exhaustive-deps
+ 
+@@ -126,9 +145,10 @@ export default function CouponsPage() {
+   }
+ 
+   function downloadCsv(rows: Coupon[], filename: string) {
+-    const header = ['code', 'discount_type', 'discount_value', 'expires_at', 'created_at', 'content']
++    const header = ['code', 'code_prefix', 'discount_type', 'discount_value', 'expires_at', 'created_at', 'content']
+     const lines  = rows.map(c => [
+       c.code,
++      c.code_prefix,
+       c.discount_type,
+       c.discount_value,
+       c.expires_at ?? '',
+@@ -160,6 +180,13 @@ export default function CouponsPage() {
+     }
+     if (!form.permanent && !form.expiresOn) { setFormError('请选择截止日期'); return }
+ 
++    // 留空 = 用默认前缀 TD（与旧行为一致）
++    const codePrefix = form.codePrefix.trim().toUpperCase()
++    if (codePrefix !== '' && !isValidCodePrefix(codePrefix)) {
++      setFormError(`活动前缀只能是 ${MIN_CODE_PREFIX_LENGTH} 到 ${MAX_CODE_PREFIX_LENGTH} 位大写字母或数字`)
++      return
++    }
++
+     setGenerating(true)
+     try {
+       const res = await fetch('/api/admin/coupons', {
+@@ -170,6 +197,7 @@ export default function CouponsPage() {
+           discountValue: value,
+           expiresOn:     form.permanent ? null : form.expiresOn,
+           quantity,
++          codePrefix,
+         }),
+       })
+       const data = await res.json() as { coupons?: Coupon[]; error?: string }
+@@ -189,6 +217,18 @@ export default function CouponsPage() {
+   const unitLabel = form.discountType === 'fixed_amount' ? '英镑（£）'
+     : form.discountType === 'percentage_off' ? '减免百分比（%）' : '减免分钟数'
+ 
++  // 前缀实时预览与提示：弹窗里只做提示，不阻断（校验在提交时做）
++  const prefixInput    = form.codePrefix.trim().toUpperCase()
++  const prefixHints    = codePrefixHints(prefixInput)
++  const prefixEffective = prefixInput === '' ? 'TD' : prefixInput
++
++  function openForm(codePrefix = '') {
++    setGenerated(null)
++    setFormError('')
++    setForm(f => ({ ...f, codePrefix }))
++    setShowForm(true)
++  }
++
+   return (
+     <div className="min-h-screen bg-stone-50">
+       <Sidebar active="/dashboard/coupons" />
+@@ -202,7 +242,7 @@ export default function CouponsPage() {
+               <p className="text-xs text-stone-400 mt-0.5">单次核销，每笔计时订单最多使用一张</p>
+             </div>
+             <button
+-              onClick={() => { setGenerated(null); setFormError(''); setShowForm(true) }}
++              onClick={() => openForm()}
+               className="px-4 py-2 bg-terracotta text-white rounded-xl text-sm font-medium hover:bg-terracotta/90 transition shadow-sm"
+             >
+               ＋ 生成优惠券
+@@ -297,13 +337,41 @@ export default function CouponsPage() {
+             </div>
+           </div>
+ 
++          {/* 前缀筛选（点一下只看某个活动的券） */}
++          {(usedPrefixes.length > 0 || prefixFilter !== '') && (
++            <div className="flex items-center gap-2 flex-wrap">
++              <span className="text-xs text-stone-400">活动前缀</span>
++              <button
++                onClick={() => { setPrefixFilter(''); setPage(1) }}
++                className={`px-3 py-1 rounded-full text-xs font-medium transition ${prefixFilter === '' ? 'bg-terracotta text-white' : 'bg-white text-stone-500 border border-stone-200 hover:border-terracotta/40'}`}
++              >
++                全部
++              </button>
++              {usedPrefixes.map(p => (
++                <button
++                  key={p.code_prefix}
++                  onClick={() => { setPrefixFilter(p.code_prefix); setPage(1) }}
++                  title={`${p.uses} 张 · 最近 ${formatLondon(p.last_created_at)}`}
++                  className={`px-3 py-1 rounded-full text-xs font-mono font-medium transition ${prefixFilter === p.code_prefix ? 'bg-terracotta text-white' : 'bg-white text-stone-500 border border-stone-200 hover:border-terracotta/40'}`}
++                >
++                  {p.code_prefix}<span className="opacity-60 font-sans"> {p.uses}</span>
++                </button>
++              ))}
++              {prefixFilter !== '' && !usedPrefixes.some(p => p.code_prefix === prefixFilter) && (
++                <span className="px-3 py-1 rounded-full text-xs font-mono font-medium bg-terracotta text-white">
++                  {prefixFilter}
++                </span>
++              )}
++            </div>
++          )}
++
+           {/* 列表 */}
+           {loading ? (
+             <div className="text-center py-12 text-stone-400">加载中…</div>
+           ) : coupons.length === 0 ? (
+             <div className="text-center py-12 text-stone-400">
+               <p className="text-3xl mb-2">🎟</p>
+-              <p>{status === 'all' && !search ? '还没有优惠券，点上方「生成优惠券」开始' : '没有符合条件的优惠券'}</p>
++              <p>{status === 'all' && !search && !prefixFilter ? '还没有优惠券，点上方「生成优惠券」开始' : '没有符合条件的优惠券'}</p>
+             </div>
+           ) : (
+             <div className="space-y-2">
+@@ -325,6 +393,19 @@ export default function CouponsPage() {
+                           <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${statusChip[st]}`}>
+                             {COUPON_STATUS_LABELS[st]}
+                           </span>
++                          <span
++                            className="text-xs px-2 py-0.5 rounded-full border border-stone-200 bg-stone-50 text-stone-500 font-mono"
++                            title="活动前缀"
++                          >
++                            {c.code_prefix}
++                          </span>
++                          <button
++                            onClick={() => openForm(c.code_prefix)}
++                            className="text-xs text-terracotta/80 hover:text-terracotta hover:underline"
++                            title={`用前缀 ${c.code_prefix} 再生成一批`}
++                          >
++                            再生成一批
++                          </button>
+                         </div>
+                         <p className="text-sm text-terracotta font-medium mt-1">
+                           {describeDiscount(c.discount_type, c.discount_value)}
+@@ -383,6 +464,55 @@ export default function CouponsPage() {
+           >
+             <p className="text-base font-semibold text-stone-800 mb-4">生成优惠券</p>
+ 
++            {/* 活动前缀 */}
++            <div className="mb-4">
++              <div className="flex items-center justify-between mb-1">
++                <label className="block text-xs text-stone-400">活动前缀（选填）</label>
++                {form.codePrefix !== '' && (
++                  <button
++                    onClick={() => setForm(f => ({ ...f, codePrefix: '' }))}
++                    className="text-xs text-stone-400 hover:text-stone-600"
++                  >
++                    清空
++                  </button>
++                )}
++              </div>
++              <input
++                className={inputCls + ' font-mono'}
++                placeholder="留空 = TD"
++                maxLength={MAX_CODE_PREFIX_LENGTH}
++                value={form.codePrefix}
++                onChange={e => setForm(f => ({ ...f, codePrefix: e.target.value.toUpperCase() }))}
++              />
++              {usedPrefixes.length > 0 && (
++                <div className="flex items-center gap-1.5 flex-wrap mt-2">
++                  <span className="text-xs text-stone-400 shrink-0">用过的</span>
++                  {usedPrefixes.map(p => (
++                    <button
++                      key={p.code_prefix}
++                      onClick={() => setForm(f => ({ ...f, codePrefix: p.code_prefix }))}
++                      title={`${p.uses} 张 · 最近 ${formatLondon(p.last_created_at)}`}
++                      className={`px-2 py-0.5 rounded-full text-xs font-mono border transition ${prefixInput === p.code_prefix ? 'bg-terracotta text-white border-terracotta' : 'bg-white text-stone-600 border-stone-200 hover:border-terracotta/40'}`}
++                    >
++                      {p.code_prefix}
++                    </button>
++                  ))}
++                </div>
++              )}
++              {prefixInput !== '' && !isValidCodePrefix(prefixInput) && (
++                <p className="text-xs text-red-500 mt-1">
++                  前缀只能是 {MIN_CODE_PREFIX_LENGTH} 到 {MAX_CODE_PREFIX_LENGTH} 位大写字母或数字
++                </p>
++              )}
++              {prefixHints.map(h => (
++                <p key={h} className="text-xs text-amber-600 mt-1">{h}</p>
++              ))}
++              <p className="text-xs text-stone-400 mt-1">
++                券码 = 活动前缀 + {COUPON_CODE_LENGTH} 位随机后缀，例如 <span className="font-mono">{prefixEffective}7K2QP</span>。
++                后缀随机生成，不做顺序号。
++              </p>
++            </div>
++
+             {/* 优惠类型 */}
+             <p className="text-xs text-stone-400 mb-2">优惠类型</p>
+             <div className="grid grid-cols-3 gap-2 mb-4">
+diff --git a/app/api/admin/coupons/route.ts b/app/api/admin/coupons/route.ts
+index 902735b..50a8226 100644
+--- a/app/api/admin/coupons/route.ts
++++ b/app/api/admin/coupons/route.ts
+@@ -24,6 +24,7 @@ export async function GET(request: NextRequest) {
+     ? statusParam as StatusFilter
+     : 'all'
+   const search   = (searchParams.get('search') ?? '').trim().toUpperCase()
++  const prefix   = (searchParams.get('prefix') ?? '').trim().toUpperCase()
+   const page     = Math.max(1, parseInt(searchParams.get('page') ?? '1', 10) || 1)
+   const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(searchParams.get('pageSize') ?? String(DEFAULT_PAGE_SIZE), 10) || DEFAULT_PAGE_SIZE))
+ 
+@@ -36,6 +37,7 @@ export async function GET(request: NextRequest) {
+     .order('created_at', { ascending: false })
+ 
+   if (search) query = query.ilike('code', `%${search}%`)
++  if (prefix) query = query.eq('code_prefix', prefix)
+ 
+   if (status === 'unused') {
+     query = query.is('redeemed_at', null).or(`expires_at.is.null,expires_at.gte.${now}`)
+@@ -54,10 +56,12 @@ export async function GET(request: NextRequest) {
+   }
+ 
+   // 简单统计（不受分页/筛选影响，覆盖全表）
+-  const [totalRes, redeemedRes, expiredRes] = await Promise.all([
++  const [totalRes, redeemedRes, expiredRes, prefixRes] = await Promise.all([
+     admin.from('coupons').select('*', { count: 'exact', head: true }),
+     admin.from('coupons').select('*', { count: 'exact', head: true }).not('redeemed_at', 'is', null),
+     admin.from('coupons').select('*', { count: 'exact', head: true }).is('redeemed_at', null).lt('expires_at', now),
++    // 已用前缀列表（使用张数 + 最近使用时间），供生成弹窗快捷复用
++    admin.rpc('coupon_prefix_usage'),
+   ])
+ 
+   const total    = totalRes.count    ?? 0
+@@ -65,6 +69,10 @@ export async function GET(request: NextRequest) {
+   const expired  = expiredRes.count  ?? 0
+   const available = Math.max(0, total - redeemed - expired)
+ 
++  if (prefixRes.error) {
++    console.error('[GET /api/admin/coupons] coupon_prefix_usage', prefixRes.error.message)
++  }
++
+   return NextResponse.json({
+     coupons:   data ?? [],
+     page,
+@@ -72,6 +80,7 @@ export async function GET(request: NextRequest) {
+     total:     count ?? 0,
+     totalPages: Math.max(1, Math.ceil((count ?? 0) / pageSize)),
+     stats:     { total, available, redeemed, expired },
++    usedPrefixes: prefixRes.error ? [] : (prefixRes.data ?? []),
+   })
+ }
+ 
+@@ -82,14 +91,14 @@ export async function POST(request: NextRequest) {
+   const { data: { user } } = await supabase.auth.getUser()
+   if (!user) return NextResponse.json({ error: '未授权' }, { status: 401 })
+ 
+-  let body: { discountType?: unknown; discountValue?: unknown; expiresOn?: unknown; quantity?: unknown }
++  let body: { discountType?: unknown; discountValue?: unknown; expiresOn?: unknown; quantity?: unknown; codePrefix?: unknown }
+   try { body = await request.json() } catch {
+     return NextResponse.json({ error: '请求格式错误' }, { status: 400 })
+   }
+ 
+   const validation = validateGenerateInput(body)
+   if (!validation.ok) return NextResponse.json({ error: validation.error }, { status: 400 })
+-  const { discountType, discountValue, expiresOn, quantity } = validation.value
++  const { discountType, discountValue, expiresOn, quantity, codePrefix } = validation.value
+ 
+   let expiresAt: string | null = null
+   if (expiresOn) {
+@@ -102,11 +111,12 @@ export async function POST(request: NextRequest) {
+ 
+   // 随机码碰撞概率极低，但仍以数据库唯一约束兜底：冲突时换一批重试
+   for (let attempt = 0; attempt < 3; attempt++) {
+-    const codes = generateCouponCodes(quantity)
++    const codes = generateCouponCodes(quantity, codePrefix)
+     const { data, error } = await admin
+       .from('coupons')
+       .insert(codes.map(code => ({
+         code,
++        code_prefix:    codePrefix,
+         discount_type:  discountType,
+         discount_value: discountValue,
+         expires_at:     expiresAt,
+diff --git a/lib/coupon/code.ts b/lib/coupon/code.ts
+index 1bda983..c505233 100644
+--- a/lib/coupon/code.ts
++++ b/lib/coupon/code.ts
+@@ -7,18 +7,21 @@ import { COUPON_CODE_LENGTH, COUPON_CODE_PREFIX } from './coupon.ts'
+ // 排除易混淆字符：0 / O、1 / I
+ export const COUPON_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+ 
+-/** 生成一张优惠码，格式：TD + 8 位大写字母数字 */
+-export function generateCouponCode(): string {
++/** 生成一张优惠码，格式：活动前缀 + 5 位大写字母数字随机后缀 */
++export function generateCouponCode(prefix: string = COUPON_CODE_PREFIX): string {
+   let suffix = ''
+   for (let i = 0; i < COUPON_CODE_LENGTH; i++) {
+     suffix += COUPON_CODE_ALPHABET[randomInt(COUPON_CODE_ALPHABET.length)]
+   }
+-  return `${COUPON_CODE_PREFIX}${suffix}`
++  return `${prefix}${suffix}`
+ }
+ 
+-/** 批量生成互不重复的优惠码（同批次内去重） */
+-export function generateCouponCodes(quantity: number): string[] {
++/**
++ * 批量生成互不重复的优惠码（同批次内去重）。
++ * 后缀随机、不做顺序号：递增数字可被枚举，明确否决。
++ */
++export function generateCouponCodes(quantity: number, prefix: string = COUPON_CODE_PREFIX): string[] {
+   const codes = new Set<string>()
+-  while (codes.size < quantity) codes.add(generateCouponCode())
++  while (codes.size < quantity) codes.add(generateCouponCode(prefix))
+   return [...codes]
+ }
+diff --git a/lib/coupon/coupon.ts b/lib/coupon/coupon.ts
+index d21c347..087955e 100644
+--- a/lib/coupon/coupon.ts
++++ b/lib/coupon/coupon.ts
+@@ -9,8 +9,11 @@ import { TIMER_PRICING } from '../timer/pricing.ts'
+ export type DiscountType = 'fixed_amount' | 'percentage_off' | 'time_minutes'
+ export type CouponStatus = 'unused' | 'redeemed' | 'expired'
+ 
+-export const COUPON_CODE_PREFIX       = 'TD'
+-export const COUPON_CODE_LENGTH       = 8      // 去掉易混淆字符后随机位数
++export const COUPON_CODE_PREFIX       = 'TD'   // 未指定活动前缀时的默认值（向后兼容）
++export const COUPON_CODE_LENGTH       = 5      // 去掉易混淆字符后随机位数
++export const MIN_CODE_PREFIX_LENGTH   = 2      // 活动前缀长度范围
++export const MAX_CODE_PREFIX_LENGTH   = 8
++export const RECOMMENDED_CODE_PREFIX_LENGTH = 5  // 超过则提示总长度偏长
+ export const MIN_BILLING_MINUTES      = 60     // 首小时不可减免
+ export const TIME_COUPON_STEP_MINUTES = 30     // 时长券必须是 30 分钟的整数倍
+ export const MAX_GENERATE_QUANTITY    = 500    // 单次生成上限
+@@ -42,6 +45,38 @@ export function normalizeCouponCode(raw: unknown): string {
+   return typeof raw === 'string' ? raw.trim().toUpperCase() : ''
+ }
+ 
++// ── 活动前缀 ────────────────────────────────────────────────────────────────
++
++/** 活动前缀规范化：去首尾空格 + 转大写；非字符串返回空串（调用方按默认前缀处理） */
++export function normalizeCodePrefix(raw: unknown): string {
++  return typeof raw === 'string' ? raw.trim().toUpperCase() : ''
++}
++
++const CODE_PREFIX_PATTERN = /^[A-Z0-9]+$/
++
++/** 前缀是否合法：2-8 位大写字母或数字 */
++export function isValidCodePrefix(prefix: string): boolean {
++  return prefix.length >= MIN_CODE_PREFIX_LENGTH
++    && prefix.length <= MAX_CODE_PREFIX_LENGTH
++    && CODE_PREFIX_PATTERN.test(prefix)
++}
++
++/**
++ * 前缀的非阻断提示（不阻止生成，只在弹窗里提醒店员）。
++ * 空数组表示没有可提示的。
++ */
++export function codePrefixHints(prefix: string): string[] {
++  if (!prefix) return []
++  const hints: string[] = []
++  if (/[0O1I]/.test(prefix)) {
++    hints.push('前缀含 0 / O / 1 / I，顾客口头报号时容易听串，建议换掉')
++  }
++  if (prefix.length > RECOMMENDED_CODE_PREFIX_LENGTH) {
++    hints.push(`前缀 ${prefix.length} 位，加上 ${COUPON_CODE_LENGTH} 位随机码共 ${prefix.length + COUPON_CODE_LENGTH} 位，店员输入容易出错`)
++  }
++  return hints
++}
++
+ // ── 状态判定 ────────────────────────────────────────────────────────────────
+ 
+ export interface CouponStateFields {
+@@ -122,6 +157,7 @@ export interface GenerateCouponInput {
+   discountValue: number
+   expiresOn:     string | null   // 伦敦当地 YYYY-MM-DD，null = 永久有效
+   quantity:      number
++  codePrefix:    string          // 已规范化的大写活动前缀，未填时为 COUPON_CODE_PREFIX
+ }
+ 
+ export type GenerateValidation =
+@@ -133,6 +169,7 @@ export function validateGenerateInput(raw: {
+   discountValue?: unknown
+   expiresOn?: unknown
+   quantity?: unknown
++  codePrefix?: unknown
+ }, now: Date = new Date()): GenerateValidation {
+   const type = raw.discountType
+   if (type !== 'fixed_amount' && type !== 'percentage_off' && type !== 'time_minutes') {
+@@ -181,7 +218,24 @@ export function validateGenerateInput(raw: {
+     return { ok: false, error: `生成数量必须是 ${MIN_GENERATE_QUANTITY} 到 ${MAX_GENERATE_QUANTITY} 之间的整数` }
+   }
+ 
+-  return { ok: true, value: { discountType: type, discountValue: value, expiresOn, quantity } }
++  // 活动前缀：只有「没填」（undefined / null / 空白字符串）才回退默认值；
++  // 填了错的东西（非字符串、非法字符、长度越界）一律拒绝，不静默吞掉。
++  const rawPrefix = raw.codePrefix
++  const prefixProvided = !(
++    rawPrefix === undefined
++    || rawPrefix === null
++    || (typeof rawPrefix === 'string' && rawPrefix.trim() === '')
++  )
++  const normalizedPrefix = normalizeCodePrefix(rawPrefix)
++  if (prefixProvided && !isValidCodePrefix(normalizedPrefix)) {
++    return {
++      ok: false,
++      error: `活动前缀只能是 ${MIN_CODE_PREFIX_LENGTH} 到 ${MAX_CODE_PREFIX_LENGTH} 位大写字母或数字`,
++    }
++  }
++  const codePrefix = prefixProvided ? normalizedPrefix : COUPON_CODE_PREFIX
++
++  return { ok: true, value: { discountType: type, discountValue: value, expiresOn, quantity, codePrefix } }
+ }
+ 
+ // ── 优惠计算 / 预验证 ───────────────────────────────────────────────────────
+diff --git a/supabase/migrations/015_coupon_prefix.sql b/supabase/migrations/015_coupon_prefix.sql
+new file mode 100644
+index 0000000..5f0bd58
+--- /dev/null
++++ b/supabase/migrations/015_coupon_prefix.sql
+@@ -0,0 +1,57 @@
++-- ============================================================
++-- 优惠券「活动前缀」（PRD v1.1 增量）
++--
++-- 背景：店铺按活动发券，希望券码带活动标识（新生周 WELCOME…、中秋 LUCKY…）。
++--       这推翻了 PRD v1.0「不允许店员自定义优惠码」的决定，故列改为可自定义前缀。
++--
++-- 说明：
++--   1) 前缀由店员自定义（2-8 位大写字母数字），后缀仍由系统随机生成（5 位）。
++--      后缀保持随机、不做顺序号：递增数字可被枚举，明确否决。
++--   2) 存量券全部是 TD + 8 位，默认值 'TD' 即可覆盖回填，无需单独 UPDATE。
++--   3) code 的唯一索引（idx_coupons_code，013 建）保持不动，继续作为撞码兜底。
++--   4) 应用访问 coupons 全部走 service role（lib/supabase/admin.ts），因此
++--      coupon_prefix_usage() 只授权给 service_role，anon / authenticated 无法经
++--      PostgREST 调用（RLS 已在 013 为 coupons 启用，本文件不重复开）。
++-- ============================================================
++
++-- ── 1. 新增列 ────────────────────────────────────────────────────────────────
++
++ALTER TABLE coupons ADD COLUMN IF NOT EXISTS code_prefix TEXT NOT NULL DEFAULT 'TD';
++
++-- ── 2. 前缀格式约束 ──────────────────────────────────────────────────────────
++
++-- 格式：2-8 位大写字母或数字；同时校验与 code 的一致性（code 必然以该前缀开头），
++-- 防止将来某条写入路径漏填 code_prefix 造成两者不一致。
++ALTER TABLE coupons DROP CONSTRAINT IF EXISTS coupons_code_prefix_check;
++ALTER TABLE coupons ADD CONSTRAINT coupons_code_prefix_check
++  CHECK (
++    code_prefix ~ '^[A-Z0-9]{2,8}$'
++    AND left(code, length(code_prefix)) = code_prefix
++  );
++
++-- ── 3. 索引（按前缀筛选 + 前缀使用统计）─────────────────────────────────────
++
++CREATE INDEX IF NOT EXISTS idx_coupons_code_prefix ON coupons(code_prefix);
++
++-- ── 4. 已用前缀列表（供生成弹窗快捷复用）───────────────────────────────────
++
++-- PostgREST 在本项目禁用了聚合函数（PGRST123），GROUP BY 必须落在数据库里。
++-- 返回每个前缀的使用张数与最近使用时间，按最近使用倒序。
++CREATE OR REPLACE FUNCTION coupon_prefix_usage()
++RETURNS TABLE (code_prefix TEXT, uses BIGINT, last_created_at TIMESTAMPTZ)
++LANGUAGE sql
++STABLE
++SECURITY DEFINER
++SET search_path = public
++AS $$
++  SELECT c.code_prefix,
++         count(*)::bigint,
++         max(c.created_at)
++  FROM coupons c
++  GROUP BY c.code_prefix
++  ORDER BY max(c.created_at) DESC
++$$;
++
++REVOKE EXECUTE ON FUNCTION coupon_prefix_usage() FROM PUBLIC;
++REVOKE EXECUTE ON FUNCTION coupon_prefix_usage() FROM anon, authenticated;
++GRANT  EXECUTE ON FUNCTION coupon_prefix_usage() TO service_role;
+diff --git a/tests/coupon.test.ts b/tests/coupon.test.ts
+index d600eba..0bc5861 100644
+--- a/tests/coupon.test.ts
++++ b/tests/coupon.test.ts
+@@ -2,12 +2,16 @@ import assert from 'node:assert/strict'
+ import test from 'node:test'
+ import { calcBill } from '../lib/timer/pricing.ts'
+ import {
++  COUPON_CODE_LENGTH,
++  codePrefixHints,
+   computeSettlement,
+   couponStatus,
+   describeDiscount,
++  isValidCodePrefix,
+   isValidDateString,
+   londonEndOfDayToUtcIso,
+   londonToday,
++  normalizeCodePrefix,
+   normalizeCouponCode,
+   toPence,
+   validateGenerateInput,
+@@ -229,24 +233,117 @@ test('日期与伦敦当日判断', () => {
+ 
+ // ── 优惠码生成 ──────────────────────────────────────────────────────────────
+ 
+-test('优惠码格式：TD 前缀 + 8 位，且不含易混淆字符', () => {
++test('优惠码格式：默认 TD 前缀 + 5 位，且不含易混淆字符', () => {
+   const code = generateCouponCode()
+-  assert.match(code, /^TD[A-Z2-9]{8}$/)
+-  assert.equal(code.length, 10)
++  assert.match(code, /^TD[A-Z2-9]{5}$/)
++  assert.equal(code.length, 7)
+   for (const ch of code.slice(2)) {
+     assert.ok(COUPON_CODE_ALPHABET.includes(ch), `${ch} 不在字符集中`)
+   }
+   assert.equal(/[0O1I]/.test(code), false)
+ })
+ 
++test('优惠码格式：自定义活动前缀加 5 位随机后缀', () => {
++  const welcome = generateCouponCode('WELCOME')
++  assert.match(welcome, /^WELCOME[A-Z2-9]{5}$/)
++  assert.equal(welcome.length, 12)
++
++  const lucky = generateCouponCode('LUCKY')
++  assert.match(lucky, /^LUCKY[A-Z2-9]{5}$/)
++})
++
++test('批量生成：指定前缀时全部带该前缀且互不重复', () => {
++  const codes = generateCouponCodes(500, 'WELCOME')
++  assert.equal(codes.length, 500)
++  assert.equal(new Set(codes).size, 500)
++  for (const c of codes) assert.match(c, /^WELCOME[A-Z2-9]{5}$/)
++})
++
+ test('批量生成的优惠码互不重复', () => {
+   const codes = generateCouponCodes(500)
+   assert.equal(codes.length, 500)
+   assert.equal(new Set(codes).size, 500)
+ })
+ 
++test('批量生成不传前缀时沿用默认 TD（向后兼容）', () => {
++  for (const c of generateCouponCodes(20)) assert.match(c, /^TD[A-Z2-9]{5}$/)
++})
++
+ test('便士换算按分四舍五入', () => {
+   assert.equal(toPence(13.99), 1399)
+   assert.equal(toPence(19.985), 1999)
+   assert.equal(toPence(0.005), 1)
+ })
++
++// ── 活动前缀 ────────────────────────────────────────────────────────────────
++
++test('前缀规范化：去首尾空格 + 转大写，非字符串返回空串', () => {
++  assert.equal(normalizeCodePrefix('  welcome '), 'WELCOME')
++  assert.equal(normalizeCodePrefix('lucky'), 'LUCKY')
++  assert.equal(normalizeCodePrefix(undefined), '')
++  assert.equal(normalizeCodePrefix(null), '')
++  assert.equal(normalizeCodePrefix(123), '')
++})
++
++test('前缀合法性：2-8 位大写字母数字', () => {
++  assert.equal(isValidCodePrefix('AB'), true)
++  assert.equal(isValidCodePrefix('ABCDEFGH'), true)   // 8 位上限
++  assert.equal(isValidCodePrefix('WELCOME'), true)
++  assert.equal(isValidCodePrefix('AB12'), true)
++
++  assert.equal(isValidCodePrefix('A'), false)          // 太短
++  assert.equal(isValidCodePrefix('ABCDEFGHI'), false)  // 9 位太长
++  assert.equal(isValidCodePrefix('WELCOME!'), false)   // 非法字符
++  assert.equal(isValidCodePrefix('wel come'), false)   // 含空格
++  assert.equal(isValidCodePrefix('中秋'), false)        // 中文
++  assert.equal(isValidCodePrefix(''), false)
++})
++
++test('前缀提示：易混淆字符与超长前缀会给非阻断提示', () => {
++  // 不含 O / I、且不超过 5 位的活动名没有提示
++  assert.deepEqual(codePrefixHints('LUCKY'), [])
++  assert.deepEqual(codePrefixHints('MERRY'), [])
++  assert.deepEqual(codePrefixHints(''), [])
++
++  // 含 O / 0 / 1 / I 会给易混淆提示（PRD 自己的例子 WELCOME 就含 O，所以也会触发）
++  for (const prefix of ['WEL0', 'MIDI', 'A1', 'WELCOME']) {
++    const ambiguous = codePrefixHints(prefix).filter(h => /0 \/ O \/ 1 \/ I/.test(h))
++    assert.equal(ambiguous.length, 1, `${prefix} 应给一条易混淆提示`)
++  }
++
++  // 超过 5 位会给总长度提示
++  const long = codePrefixHints('WELCOME').filter(h => /共 12 位/.test(h))
++  assert.equal(long.length, 1)
++  assert.match(long[0], /7 位/)
++
++  // 两条都可能同时出现：LONGONE 7 位且含 O
++  assert.equal(codePrefixHints('LONGONE').length, 2)
++})
++
++test('生成参数：前缀留空回退默认 TD', () => {
++  for (const raw of [undefined, null, '', '   ']) {
++    const res = validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: null, quantity: 1, codePrefix: raw }, TODAY)
++    assert.equal(res.ok, true, `${JSON.stringify(raw)} 应回退默认值`)
++    if (res.ok) assert.equal(res.value.codePrefix, 'TD')
++  }
++})
++
++test('生成参数：前缀自动转大写去空格', () => {
++  const res = validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: null, quantity: 1, codePrefix: ' welcome ' }, TODAY)
++  assert.equal(res.ok, true)
++  if (res.ok) assert.equal(res.value.codePrefix, 'WELCOME')
++})
++
++test('生成参数：非法前缀被拒绝', () => {
++  for (const raw of ['A', 'ABCDEFGHI', 'WELCOME!', 'WEL COME', '中秋', 123, 'WE-LCOME']) {
++    const res = validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: null, quantity: 1, codePrefix: raw }, TODAY)
++    assert.equal(res.ok, false, `${JSON.stringify(raw)} 应被拒绝`)
++    if (!res.ok) assert.equal(res.error, '活动前缀只能是 2 到 8 位大写字母或数字')
++  }
++})
++
++test('后缀长度为 5 位（PRD v1.1 由 8 位下调，撞码仍由唯一索引兜底）', () => {
++  assert.equal(COUPON_CODE_LENGTH, 5)
++  const code = generateCouponCode('AB')
++  assert.equal(code.length, 2 + COUPON_CODE_LENGTH)
++})

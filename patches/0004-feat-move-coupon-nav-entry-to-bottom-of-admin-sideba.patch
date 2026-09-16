@@ -1,0 +1,30 @@
+From 1778db4e799c51c0d46ac775162127d3728f53b1 Mon Sep 17 00:00:00 2001
+From: Zwei-0122 <325088970+Zwei-0122@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 13:44:36 +0100
+Subject: [PATCH 4/4] feat: move coupon nav entry to bottom of admin sidebar
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+后台侧边栏的优惠券入口由第四位移到 navItems 列表末尾，仍是最后一项、
+紧邻底部区域。上游基线本来只有五项，本功能新增的这一项改为追加，
+避免在中间插行。
+---
+ components/admin/Sidebar.tsx | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/components/admin/Sidebar.tsx b/components/admin/Sidebar.tsx
+index fecf51e..6fc642a 100644
+--- a/components/admin/Sidebar.tsx
++++ b/components/admin/Sidebar.tsx
+@@ -11,9 +11,9 @@ const navItems = [
+   { href: '/dashboard',          icon: LayoutDashboard, label: '概览' },
+   { href: '/dashboard/bookings', icon: CalendarDays,    label: '预约管理' },
+   { href: '/dashboard/timers',   icon: Timer,           label: '拼豆计时' },
+-  { href: '/dashboard/coupons',  icon: TicketPercent,   label: '优惠券' },
+   { href: '/dashboard/slots',    icon: Settings2,       label: 'Slot 配置' },
+   { href: '/dashboard/gallery',  icon: ImageIcon,       label: '作品图库' },
++  { href: '/dashboard/coupons',  icon: TicketPercent,   label: '优惠券' },
+ ]
+ 
+ export default function Sidebar({ active }: { active: string }) {

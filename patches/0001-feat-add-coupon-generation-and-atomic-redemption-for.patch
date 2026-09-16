@@ -1,0 +1,2119 @@
+From b77b58f1fe1bdfd4365749cc199396a15f816de4 Mon Sep 17 00:00:00 2001
+From: Zwei-0122 <325088970+Zwei-0122@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 00:57:29 +0100
+Subject: [PATCH 1/4] feat: add coupon generation and atomic redemption for
+ timer settlement
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 新增 coupons 表、约束、索引与 RLS（supabase/migrations/013_coupons.sql）
+- 新增 settle_timer_session / unsettle_timer_session 事务函数：核销与结算在同一事务内完成，靠 SELECT FOR UPDATE + 部分唯一索引防止并发重复使用
+- 新增 GET/POST /api/admin/coupons（列表/统计/批量生成）与 POST /api/admin/coupons/validate（只预览，不核销）
+- 结算改为服务端计算金额并调用事务函数核销，忽略客户端传入的金额字段；新增 unsettle action
+- 新增优惠券管理页 /dashboard/coupons 与侧边栏入口；改造计时订单结算面板（去掉手动改价，加优惠码验证与撤销结算）
+- 新增 lib/coupon 纯函数（金额按便士整数计算）与 29 项测试
+---
+ app/(admin)/dashboard/coupons/page.tsx     | 498 +++++++++++++++++++++
+ app/(admin)/dashboard/timers/[id]/page.tsx | 188 ++++++--
+ app/api/admin/coupons/route.ts             | 128 ++++++
+ app/api/admin/coupons/validate/route.ts    |  30 ++
+ app/api/admin/timers/[id]/route.ts         |  73 +--
+ components/admin/Sidebar.tsx               |   3 +-
+ lib/coupon/code.ts                         |  24 +
+ lib/coupon/coupon.ts                       | 302 +++++++++++++
+ lib/coupon/service.ts                      |  81 ++++
+ supabase/migrations/013_coupons.sql        | 292 ++++++++++++
+ tests/coupon.test.ts                       | 252 +++++++++++
+ 11 files changed, 1812 insertions(+), 59 deletions(-)
+ create mode 100644 app/(admin)/dashboard/coupons/page.tsx
+ create mode 100644 app/api/admin/coupons/route.ts
+ create mode 100644 app/api/admin/coupons/validate/route.ts
+ create mode 100644 lib/coupon/code.ts
+ create mode 100644 lib/coupon/coupon.ts
+ create mode 100644 lib/coupon/service.ts
+ create mode 100644 supabase/migrations/013_coupons.sql
+ create mode 100644 tests/coupon.test.ts
+
+diff --git a/app/(admin)/dashboard/coupons/page.tsx b/app/(admin)/dashboard/coupons/page.tsx
+new file mode 100644
+index 0000000..4bc5b95
+--- /dev/null
++++ b/app/(admin)/dashboard/coupons/page.tsx
+@@ -0,0 +1,498 @@
++'use client'
++
++import { useCallback, useEffect, useState } from 'react'
++import Link from 'next/link'
++import Sidebar from '@/components/admin/Sidebar'
++import {
++  COUPON_STATUS_LABELS,
++  MAX_GENERATE_QUANTITY,
++  TIME_COUPON_STEP_MINUTES,
++  couponStatus,
++  describeDiscount,
++  londonToday,
++  type CouponStatus,
++  type DiscountType,
++} from '@/lib/coupon/coupon'
++
++interface Coupon {
++  coupon_id:           string
++  code:                string
++  discount_type:       DiscountType
++  discount_value:      number
++  expires_at:          string | null
++  redeemed_at:         string | null
++  redeemed_by:         string | null
++  redeemed_session_id: string | null
++  created_by:          string
++  created_at:          string
++}
++
++interface CouponStats {
++  total:     number
++  available: number
++  redeemed:  number
++  expired:   number
++}
++
++const PAGE_SIZE = 50
++
++const statusChip: Record<CouponStatus, string> = {
++  unused:   'bg-emerald-50 text-emerald-700 border-emerald-200',
++  redeemed: 'bg-stone-100 text-stone-500 border-stone-200',
++  expired:  'bg-amber-50 text-amber-700 border-amber-200',
++}
++
++const STATUS_FILTERS = [
++  { value: 'all',      label: '全部' },
++  { value: 'unused',   label: '未使用' },
++  { value: 'redeemed', label: '已使用' },
++  { value: 'expired',  label: '已过期' },
++] as const
++
++function formatLondon(iso: string | null): string {
++  if (!iso) return ''
++  return new Date(iso).toLocaleString('zh-CN', { timeZone: 'Europe/London', hour12: false })
++}
++
++function expiryLabel(expiresAt: string | null): string {
++  return expiresAt ? `截至 ${formatLondon(expiresAt)}` : '永久有效'
++}
++
++function csvEscape(value: string | number): string {
++  const s = String(value)
++  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
++}
++
++export default function CouponsPage() {
++  const [coupons, setCoupons]   = useState<Coupon[]>([])
++  const [stats, setStats]       = useState<CouponStats>({ total: 0, available: 0, redeemed: 0, expired: 0 })
++  const [loading, setLoading]   = useState(true)
++  const [page, setPage]         = useState(1)
++  const [totalPages, setTotal]  = useState(1)
++  const [total, setTotalRows]   = useState(0)
++  const [status, setStatus]     = useState<string>('all')
++  const [searchInput, setSearchInput] = useState('')
++  const [search, setSearch]     = useState('')
++  const [copied, setCopied]     = useState('')
++
++  // 生成弹窗
++  const [showForm, setShowForm] = useState(false)
++  const [form, setForm]         = useState({
++    discountType:  'fixed_amount' as DiscountType,
++    discountValue: '2',
++    permanent:     true,
++    expiresOn:     londonToday(),
++    quantity:      '1',
++  })
++  const [generating, setGenerating] = useState(false)
++  const [formError, setFormError]   = useState('')
++  const [generated, setGenerated]   = useState<Coupon[] | null>(null)
++
++  const load = useCallback(async () => {
++    setLoading(true)
++    const params = new URLSearchParams({
++      page:     String(page),
++      pageSize: String(PAGE_SIZE),
++      status,
++      search,
++    })
++    const res  = await fetch(`/api/admin/coupons?${params.toString()}`)
++    const data = await res.json() as {
++      coupons?: Coupon[]; stats?: CouponStats; totalPages?: number; total?: number; error?: string
++    }
++    if (!res.ok) { alert(data.error ?? '读取优惠券失败'); setLoading(false); return }
++    setCoupons(data.coupons ?? [])
++    setStats(data.stats ?? { total: 0, available: 0, redeemed: 0, expired: 0 })
++    setTotal(data.totalPages ?? 1)
++    setTotalRows(data.total ?? 0)
++    setLoading(false)
++  }, [page, status, search])
++
++  useEffect(() => { load() }, [load]) // eslint-disable-line react-hooks/exhaustive-deps
++
++  function runSearch() {
++    setPage(1)
++    setSearch(searchInput.trim())
++  }
++
++  async function copy(text: string, tag: string) {
++    try {
++      await navigator.clipboard.writeText(text)
++      setCopied(tag)
++      setTimeout(() => setCopied(''), 1500)
++    } catch {
++      alert('复制失败，请手动选择文本')
++    }
++  }
++
++  function downloadCsv(rows: Coupon[], filename: string) {
++    const header = ['code', 'discount_type', 'discount_value', 'expires_at', 'created_at', 'content']
++    const lines  = rows.map(c => [
++      c.code,
++      c.discount_type,
++      c.discount_value,
++      c.expires_at ?? '',
++      c.created_at,
++      describeDiscount(c.discount_type, c.discount_value),
++    ].map(csvEscape).join(','))
++    const csv = '\uFEFF' + [header.join(','), ...lines].join('\n')
++
++    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }))
++    const a   = document.createElement('a')
++    a.href = url
++    a.download = filename
++    a.click()
++    URL.revokeObjectURL(url)
++  }
++
++  async function generate() {
++    setFormError('')
++    const value = parseFloat(form.discountValue)
++    if (!Number.isFinite(value) || value <= 0) { setFormError('请输入大于 0 的优惠值'); return }
++    if (form.discountType === 'time_minutes' && (!Number.isInteger(value) || value % TIME_COUPON_STEP_MINUTES !== 0)) {
++      setFormError(`时长减免必须是 ${TIME_COUPON_STEP_MINUTES} 分钟的整数倍`)
++      return
++    }
++    const quantity = parseInt(form.quantity, 10)
++    if (!Number.isInteger(quantity) || quantity < 1 || quantity > MAX_GENERATE_QUANTITY) {
++      setFormError(`生成数量必须是 1 到 ${MAX_GENERATE_QUANTITY} 之间的整数`)
++      return
++    }
++    if (!form.permanent && !form.expiresOn) { setFormError('请选择截止日期'); return }
++
++    setGenerating(true)
++    try {
++      const res = await fetch('/api/admin/coupons', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({
++          discountType:  form.discountType,
++          discountValue: value,
++          expiresOn:     form.permanent ? null : form.expiresOn,
++          quantity,
++        }),
++      })
++      const data = await res.json() as { coupons?: Coupon[]; error?: string }
++      if (!res.ok) { setFormError(data.error ?? '生成失败'); return }
++      setGenerated(data.coupons ?? [])
++      setShowForm(false)
++      setPage(1)
++      await load()
++    } catch {
++      setFormError('网络错误，请重试')
++    } finally {
++      setGenerating(false)
++    }
++  }
++
++  const inputCls = 'w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta'
++  const unitLabel = form.discountType === 'fixed_amount' ? '英镑（£）'
++    : form.discountType === 'percentage_off' ? '减免百分比（%）' : '减免分钟数'
++
++  return (
++    <div className="min-h-screen bg-stone-50">
++      <Sidebar active="/dashboard/coupons" />
++      <div className="md:ml-56 pt-14 md:pt-0">
++        <div className="max-w-4xl mx-auto p-4 md:p-6 space-y-5">
++
++          {/* 顶部操作 */}
++          <div className="flex items-center justify-between gap-3 flex-wrap">
++            <div>
++              <h1 className="text-xl font-bold text-stone-800">优惠券</h1>
++              <p className="text-xs text-stone-400 mt-0.5">单次核销，每笔计时订单最多使用一张</p>
++            </div>
++            <button
++              onClick={() => { setGenerated(null); setFormError(''); setShowForm(true) }}
++              className="px-4 py-2 bg-terracotta text-white rounded-xl text-sm font-medium hover:bg-terracotta/90 transition shadow-sm"
++            >
++              ＋ 生成优惠券
++            </button>
++          </div>
++
++          {/* 简单统计 */}
++          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
++            {([
++              { label: '优惠券总数', value: stats.total,     color: 'text-stone-800' },
++              { label: '当前可用',   value: stats.available, color: 'text-emerald-600' },
++              { label: '已核销',     value: stats.redeemed,  color: 'text-stone-500' },
++              { label: '已过期',     value: stats.expired,   color: 'text-amber-600' },
++            ]).map(item => (
++              <div key={item.label} className="bg-white rounded-2xl border border-stone-100 shadow-sm px-4 py-3">
++                <p className="text-xs text-stone-400">{item.label}</p>
++                <p className={`text-2xl font-bold mt-0.5 ${item.color}`}>{item.value}</p>
++              </div>
++            ))}
++          </div>
++
++          {/* 生成结果 */}
++          {generated && (
++            <div className="bg-emerald-50 border border-emerald-200 rounded-2xl px-5 py-4">
++              <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
++                <div>
++                  <p className="text-sm font-semibold text-emerald-700">
++                    已生成 {generated.length} 张 · {generated[0] ? describeDiscount(generated[0].discount_type, generated[0].discount_value) : ''}
++                  </p>
++                  <p className="text-xs text-emerald-700/70 mt-0.5">{expiryLabel(generated[0]?.expires_at ?? null)}</p>
++                </div>
++                <div className="flex gap-2">
++                  <button
++                    onClick={() => copy(generated.map(c => c.code).join('\n'), 'all')}
++                    className="px-3 py-1.5 rounded-xl bg-white border border-emerald-200 text-xs font-medium text-emerald-700 hover:bg-emerald-100 transition"
++                  >
++                    {copied === 'all' ? '已复制 ✓' : '复制全部'}
++                  </button>
++                  <button
++                    onClick={() => downloadCsv(generated, `coupons-${londonToday()}.csv`)}
++                    className="px-3 py-1.5 rounded-xl bg-white border border-emerald-200 text-xs font-medium text-emerald-700 hover:bg-emerald-100 transition"
++                  >
++                    下载 CSV
++                  </button>
++                  <button onClick={() => setGenerated(null)} className="px-2 py-1.5 text-xs text-stone-400 hover:text-stone-600">
++                    关闭
++                  </button>
++                </div>
++              </div>
++              <div className="bg-white rounded-xl border border-emerald-100 max-h-56 overflow-y-auto p-3 grid grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-1">
++                {generated.map(c => (
++                  <button
++                    key={c.coupon_id}
++                    onClick={() => copy(c.code, c.code)}
++                    className="text-left font-mono text-xs text-stone-700 hover:text-terracotta transition"
++                    title="点击复制"
++                  >
++                    {copied === c.code ? `${c.code} ✓` : c.code}
++                  </button>
++                ))}
++              </div>
++            </div>
++          )}
++
++          {/* 搜索 + 筛选 */}
++          <div className="flex items-center gap-2 flex-wrap">
++            <div className="flex gap-2 flex-1 min-w-[220px]">
++              <input
++                value={searchInput}
++                onChange={e => setSearchInput(e.target.value.toUpperCase())}
++                onKeyDown={e => e.key === 'Enter' && runSearch()}
++                placeholder="搜索优惠码"
++                className={inputCls + ' font-mono'}
++              />
++              <button
++                onClick={runSearch}
++                className="px-4 py-2 bg-stone-800 text-white rounded-xl text-sm font-medium hover:bg-stone-700 transition shrink-0"
++              >
++                搜索
++              </button>
++            </div>
++            <div className="flex gap-2 flex-wrap">
++              {STATUS_FILTERS.map(f => (
++                <button
++                  key={f.value}
++                  onClick={() => { setStatus(f.value); setPage(1) }}
++                  className={`px-3 py-1 rounded-full text-xs font-medium transition ${status === f.value ? 'bg-terracotta text-white' : 'bg-white text-stone-500 border border-stone-200 hover:border-terracotta/40'}`}
++                >
++                  {f.label}
++                </button>
++              ))}
++            </div>
++          </div>
++
++          {/* 列表 */}
++          {loading ? (
++            <div className="text-center py-12 text-stone-400">加载中…</div>
++          ) : coupons.length === 0 ? (
++            <div className="text-center py-12 text-stone-400">
++              <p className="text-3xl mb-2">🎟</p>
++              <p>{status === 'all' && !search ? '还没有优惠券，点上方「生成优惠券」开始' : '没有符合条件的优惠券'}</p>
++            </div>
++          ) : (
++            <div className="space-y-2">
++              <p className="text-xs text-stone-400 px-1">共 {total} 张</p>
++              {coupons.map(c => {
++                const st = couponStatus(c)
++                return (
++                  <div key={c.coupon_id} className="bg-white rounded-2xl border border-stone-100 shadow-sm px-4 py-3">
++                    <div className="flex items-start justify-between gap-3 flex-wrap">
++                      <div className="min-w-0">
++                        <div className="flex items-center gap-2 flex-wrap">
++                          <button
++                            onClick={() => copy(c.code, c.code)}
++                            className="font-mono text-sm font-semibold text-stone-800 hover:text-terracotta transition"
++                            title="点击复制优惠码"
++                          >
++                            {copied === c.code ? `${c.code} ✓` : c.code}
++                          </button>
++                          <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${statusChip[st]}`}>
++                            {COUPON_STATUS_LABELS[st]}
++                          </span>
++                        </div>
++                        <p className="text-sm text-terracotta font-medium mt-1">
++                          {describeDiscount(c.discount_type, c.discount_value)}
++                        </p>
++                        <p className="text-xs text-stone-400 mt-0.5">
++                          {expiryLabel(c.expires_at)} · 生成于 {formatLondon(c.created_at)}
++                        </p>
++                        <p className="text-xs text-stone-400">
++                          {c.redeemed_at ? `核销于 ${formatLondon(c.redeemed_at)}${c.redeemed_by ? ` · ${c.redeemed_by}` : ''}` : '尚未核销'}
++                        </p>
++                      </div>
++                      {c.redeemed_session_id && (
++                        <Link
++                          href={`/dashboard/timers/${c.redeemed_session_id}`}
++                          className="text-xs text-terracotta hover:underline shrink-0 font-mono"
++                        >
++                          {c.redeemed_session_id} →
++                        </Link>
++                      )}
++                    </div>
++                  </div>
++                )
++              })}
++
++              {/* 分页 */}
++              {totalPages > 1 && (
++                <div className="flex items-center justify-center gap-3 pt-2">
++                  <button
++                    onClick={() => setPage(p => Math.max(1, p - 1))}
++                    disabled={page <= 1}
++                    className="px-3 py-1.5 rounded-xl border border-stone-200 bg-white text-xs text-stone-600 disabled:opacity-40"
++                  >
++                    上一页
++                  </button>
++                  <span className="text-xs text-stone-400">{page} / {totalPages}</span>
++                  <button
++                    onClick={() => setPage(p => Math.min(totalPages, p + 1))}
++                    disabled={page >= totalPages}
++                    className="px-3 py-1.5 rounded-xl border border-stone-200 bg-white text-xs text-stone-600 disabled:opacity-40"
++                  >
++                    下一页
++                  </button>
++                </div>
++              )}
++            </div>
++          )}
++        </div>
++      </div>
++
++      {/* 生成弹窗 */}
++      {showForm && (
++        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={() => setShowForm(false)}>
++          <div
++            className="bg-white rounded-2xl w-full max-w-md max-h-[90vh] overflow-y-auto p-5 shadow-xl"
++            onClick={e => e.stopPropagation()}
++          >
++            <p className="text-base font-semibold text-stone-800 mb-4">生成优惠券</p>
++
++            {/* 优惠类型 */}
++            <p className="text-xs text-stone-400 mb-2">优惠类型</p>
++            <div className="grid grid-cols-3 gap-2 mb-4">
++              {([
++                { value: 'fixed_amount',   label: '固定金额' },
++                { value: 'percentage_off', label: '百分比折扣' },
++                { value: 'time_minutes',   label: '时长减免' },
++              ] as const).map(t => (
++                <button
++                  key={t.value}
++                  onClick={() => setForm(f => ({
++                    ...f,
++                    discountType:  t.value,
++                    discountValue: t.value === 'time_minutes' ? '30' : f.discountValue,
++                  }))}
++                  className={`px-2 py-2 rounded-xl text-xs font-medium border transition ${form.discountType === t.value ? 'bg-terracotta text-white border-terracotta' : 'bg-white text-stone-600 border-stone-200 hover:border-terracotta/40'}`}
++                >
++                  {t.label}
++                </button>
++              ))}
++            </div>
++
++            {/* 优惠值 */}
++            <div className="mb-4">
++              <label className="block text-xs text-stone-400 mb-1">{unitLabel}</label>
++              <div className="flex gap-2">
++                <input
++                  type="number" step={form.discountType === 'time_minutes' ? '30' : '0.01'} min="0"
++                  className={inputCls}
++                  value={form.discountValue}
++                  onChange={e => setForm(f => ({ ...f, discountValue: e.target.value }))}
++                />
++                {form.discountType === 'time_minutes' && (
++                  <button
++                    onClick={() => setForm(f => ({ ...f, discountValue: '30' }))}
++                    className="px-3 py-2 rounded-xl border border-stone-200 bg-white text-xs text-stone-600 hover:border-terracotta/40 shrink-0"
++                  >
++                    30 分钟
++                  </button>
++                )}
++              </div>
++              {form.discountType === 'time_minutes' && (
++                <p className="text-xs text-stone-400 mt-1">按半小时续时价抵扣；首小时不可减免，只能 {TIME_COUPON_STEP_MINUTES} 分钟的整数倍。</p>
++              )}
++              {form.discountType === 'percentage_off' && (
++                <p className="text-xs text-stone-400 mt-1">填 15 表示减免 15%，顾客支付 85%。</p>
++              )}
++            </div>
++
++            {/* 有效期 */}
++            <p className="text-xs text-stone-400 mb-2">有效期</p>
++            <div className="flex gap-2 mb-2">
++              <button
++                onClick={() => setForm(f => ({ ...f, permanent: true }))}
++                className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition ${form.permanent ? 'bg-terracotta text-white border-terracotta' : 'bg-white text-stone-600 border-stone-200 hover:border-terracotta/40'}`}
++              >
++                永久有效
++              </button>
++              <button
++                onClick={() => setForm(f => ({ ...f, permanent: false }))}
++                className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition ${!form.permanent ? 'bg-terracotta text-white border-terracotta' : 'bg-white text-stone-600 border-stone-200 hover:border-terracotta/40'}`}
++              >
++                指定截止日期
++              </button>
++            </div>
++            {!form.permanent && (
++              <div className="mb-4">
++                <input
++                  type="date"
++                  className={inputCls}
++                  min={londonToday()}
++                  value={form.expiresOn}
++                  onChange={e => setForm(f => ({ ...f, expiresOn: e.target.value }))}
++                />
++                <p className="text-xs text-stone-400 mt-1">按伦敦时间当日 23:59:59 结束。</p>
++              </div>
++            )}
++
++            {/* 数量 */}
++            <div className="mb-4 mt-3">
++              <label className="block text-xs text-stone-400 mb-1">生成数量</label>
++              <input
++                type="number" min="1" max={MAX_GENERATE_QUANTITY} step="1"
++                className={inputCls}
++                value={form.quantity}
++                onChange={e => setForm(f => ({ ...f, quantity: e.target.value }))}
++              />
++              <p className="text-xs text-stone-400 mt-1">单次最多 {MAX_GENERATE_QUANTITY} 张。</p>
++            </div>
++
++            {formError && <p className="text-sm text-red-500 mb-3">{formError}</p>}
++
++            <div className="flex gap-2">
++              <button
++                onClick={() => setShowForm(false)}
++                className="flex-1 py-2.5 rounded-xl border border-stone-200 text-sm text-stone-600 hover:bg-stone-50 transition"
++              >
++                取消
++              </button>
++              <button
++                onClick={generate}
++                disabled={generating}
++                className="flex-1 py-2.5 rounded-xl bg-terracotta text-white text-sm font-semibold hover:bg-terracotta/90 disabled:opacity-50 transition"
++              >
++                {generating ? '生成中…' : '生成'}
++              </button>
++            </div>
++          </div>
++        </div>
++      )}
++    </div>
++  )
++}
+diff --git a/app/(admin)/dashboard/timers/[id]/page.tsx b/app/(admin)/dashboard/timers/[id]/page.tsx
+index c9c3456..4d20966 100644
+--- a/app/(admin)/dashboard/timers/[id]/page.tsx
++++ b/app/(admin)/dashboard/timers/[id]/page.tsx
+@@ -3,6 +3,7 @@
+ import { useEffect, useState, useRef, useCallback } from 'react'
+ import { useParams, useRouter } from 'next/navigation'
+ import { formatHMS, formatChineseDuration, calcBillingMinutes, calcBill, TIMER_PRICING } from '@/lib/timer/pricing'
++import { describeDiscount, type DiscountType } from '@/lib/coupon/coupon'
+ 
+ interface TimerSession {
+   session_id:         string
+@@ -29,6 +30,24 @@ interface TimerSession {
+   settlement_note:    string | null
+   settled_at:         string | null
+   settled_by:         string | null
++  // 优惠券快照字段
++  coupon_id:                  string | null
++  coupon_code_snapshot:       string | null
++  discount_type_snapshot:     DiscountType | null
++  discount_value_snapshot:    number | null
++  discount_amount_gbp:        number | null
++  pre_discount_amount_gbp:    number | null
++}
++
++interface CouponPreview {
++  couponCode:          string | null
++  discountType:        DiscountType | null
++  discountValue:       number | null
++  description:         string
++  preDiscountGbp:      number
++  discountGbp:         number
++  finalGbp:            number
++  discountAmountPence: number
+ }
+ 
+ function calcElapsed(session: TimerSession): number {
+@@ -347,14 +366,23 @@ export default function AdminTimerDetailPage() {
+ }
+ 
+ // ── 结算面板 ─────────────────────────────────────────────────────────────────
++// 金额一律由服务端计算：优惠码只做预验证预览，确认结算时服务端重新校验并原子核销。
+ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSettled: () => void }) {
+-  const [actualGbp,  setActualGbp]  = useState(session.actual_amount_gbp?.toString() ?? session.amount_gbp?.toFixed(2) ?? '')
+-  const [note,       setNote]       = useState(session.settlement_note ?? '')
+-  const [saving,     setSaving]     = useState(false)
+-  const [error,      setError]      = useState('')
++  const [code,      setCode]      = useState('')
++  const [preview,   setPreview]   = useState<CouponPreview | null>(null)
++  const [note,      setNote]      = useState(session.settlement_note ?? '')
++  const [verifying, setVerifying] = useState(false)
++  const [saving,    setSaving]    = useState(false)
++  const [error,     setError]     = useState('')
++
++  const inputCls = 'w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta'
++  const money    = (n: number | null | undefined) => n === null || n === undefined ? '—' : `£${n.toFixed(2)}`
+ 
+-  // 已结算 → 只展示结果
++  // ── 已结算：展示完整收款记录 ───────────────────────────────────────────────
+   if (session.is_settled) {
++    const couponContent = session.discount_type_snapshot && session.discount_value_snapshot !== null
++      ? describeDiscount(session.discount_type_snapshot, session.discount_value_snapshot)
++      : null
+     return (
+       <div className="bg-emerald-50 border border-emerald-200 rounded-2xl px-5 py-4">
+         <div className="flex items-center gap-2 mb-3">
+@@ -366,12 +394,28 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+         </div>
+         <div className="space-y-1.5 text-sm">
+           <div className="flex justify-between">
+-            <span className="text-stone-500">应收</span>
+-            <span className="font-medium text-stone-700">£{session.amount_gbp?.toFixed(2)}</span>
++            <span className="text-stone-500">系统原价</span>
++            <span className="font-medium text-stone-700">{money(session.pre_discount_amount_gbp ?? session.amount_gbp)}</span>
+           </div>
+-          <div className="flex justify-between">
++          {session.coupon_code_snapshot && (
++            <>
++              <div className="flex justify-between">
++                <span className="text-stone-500">优惠券</span>
++                <span className="font-mono text-xs font-semibold text-stone-700">{session.coupon_code_snapshot}</span>
++              </div>
++              <div className="flex justify-between">
++                <span className="text-stone-500">优惠内容</span>
++                <span className="font-medium text-stone-700">{couponContent ?? '—'}</span>
++              </div>
++              <div className="flex justify-between">
++                <span className="text-stone-500">优惠金额</span>
++                <span className="font-medium text-terracotta">−{money(session.discount_amount_gbp ?? 0)}</span>
++              </div>
++            </>
++          )}
++          <div className="flex justify-between pt-1.5 border-t border-emerald-200">
+             <span className="text-stone-500">实收</span>
+-            <span className="font-bold text-emerald-700 text-base">£{session.actual_amount_gbp?.toFixed(2)}</span>
++            <span className="font-bold text-emerald-700 text-base">{money(session.actual_amount_gbp)}</span>
+           </div>
+           {session.actual_amount_cny && (
+             <div className="flex justify-between">
+@@ -385,17 +429,48 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+             </div>
+           )}
+           {session.booking_id && (
+-            <p className="text-xs text-stone-400 mt-1">关联预约已自动标记为已完成</p>
++            <p className="text-xs text-stone-400 mt-1">关联预约已标记为已完成</p>
+           )}
+           <p className="text-xs text-stone-400">结算人：{session.settled_by ?? '—'}</p>
+         </div>
++
++        {error && <p className="text-sm text-red-500 mt-3">{error}</p>}
++
++        <button
++          onClick={handleUnsettle}
++          disabled={saving}
++          className="mt-4 w-full py-2.5 rounded-2xl border border-red-200 bg-white text-red-500 text-sm font-medium hover:bg-red-50 disabled:opacity-50 transition"
++        >
++          {saving ? '撤销中…' : '撤销结算'}
++        </button>
+       </div>
+     )
+   }
+ 
++  async function handleVerify() {
++    const trimmed = code.trim().toUpperCase()
++    if (!trimmed) { setError('请输入优惠码'); return }
++    setError('')
++    setVerifying(true)
++    try {
++      const res  = await fetch('/api/admin/coupons/validate', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ code: trimmed, sessionId: session.session_id }),
++      })
++      const data = await res.json() as { preview?: CouponPreview; error?: string }
++      if (!res.ok || !data.preview) { setPreview(null); setError(data.error ?? '验证失败'); return }
++      setPreview(data.preview)
++    } catch {
++      setPreview(null)
++      setError('网络错误，请重试')
++    } finally {
++      setVerifying(false)
++    }
++  }
++
+   async function handleSettle() {
+-    const gbpVal = parseFloat(actualGbp)
+-    if (isNaN(gbpVal) || gbpVal < 0) { setError('请输入有效的实收金额'); return }
++    if (code.trim() && !preview) { setError('请先点击「验证」确认优惠码'); return }
+     setError('')
+     setSaving(true)
+     try {
+@@ -403,12 +478,12 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+         method: 'PATCH',
+         headers: { 'Content-Type': 'application/json' },
+         body: JSON.stringify({
+-          action:            'settle',
+-          actual_amount_gbp: gbpVal,
+-          settlement_note:   note || null,
++          action:          'settle',
++          coupon_code:     code.trim() ? code.trim().toUpperCase() : undefined,
++          settlement_note: note || null,
+         }),
+       })
+-      const data = await res.json()
++      const data = await res.json() as { error?: string }
+       if (!res.ok) { setError(data.error ?? '结算失败'); return }
+       onSettled()
+     } catch {
+@@ -418,7 +493,29 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+     }
+   }
+ 
+-  const inputCls = 'w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta'
++  async function handleUnsettle() {
++    if (!confirm('确认撤销这笔结算？订单已使用的优惠券会恢复为未使用。')) return
++    if (!confirm('再次确认：撤销后需要重新结算，继续？')) return
++    setError('')
++    setSaving(true)
++    try {
++      const res  = await fetch(`/api/admin/timers/${session.session_id}`, {
++        method: 'PATCH',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ action: 'unsettle' }),
++      })
++      const data = await res.json() as { error?: string }
++      if (!res.ok) { setError(data.error ?? '撤销失败'); return }
++      onSettled()
++    } catch {
++      setError('网络错误，请重试')
++    } finally {
++      setSaving(false)
++    }
++  }
++
++  const originalGbp = session.amount_gbp ?? 0
++  const finalGbp    = preview ? preview.finalGbp : originalGbp
+ 
+   return (
+     <div className="bg-white border border-stone-100 rounded-2xl px-5 py-4 shadow-sm">
+@@ -435,7 +532,7 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+           <span className="font-mono text-xs text-stone-600">{session.session_id}</span>
+         </div>
+         <div className="flex justify-between text-stone-500">
+-          <span>计费时长</span>
++          <span>系统计费时长</span>
+           <span className="font-medium text-stone-700">{session.billing_minutes} 分钟</span>
+         </div>
+         {session.started_at && (
+@@ -451,26 +548,50 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+           </div>
+         )}
+         <div className="flex justify-between pt-1.5 border-t border-stone-200">
+-          <span className="font-semibold text-stone-600">应收</span>
+-          <span className="font-bold text-terracotta text-base">£{session.amount_gbp?.toFixed(2)}</span>
++          <span className="font-semibold text-stone-600">系统原价</span>
++          <span className="font-bold text-stone-800 text-base">{money(originalGbp)}</span>
+         </div>
+       </div>
+ 
+-      {/* 实收输入 */}
+-      <div className="mb-3">
+-        <label className="block text-xs text-stone-400 mb-1">实收金额（£）</label>
+-        <input
+-          type="number" step="0.01" min="0"
+-          className={inputCls}
+-          value={actualGbp}
+-          onChange={e => setActualGbp(e.target.value)}
+-          placeholder={session.amount_gbp?.toFixed(2)}
+-        />
++      {/* 优惠码 */}
++      <div className="mb-4">
++        <label className="block text-xs text-stone-400 mb-1">优惠码（可选）</label>
++        <div className="flex gap-2">
++          <input
++            className={inputCls + ' font-mono'}
++            placeholder="TDXXXXXXXX"
++            value={code}
++            onChange={e => { setCode(e.target.value.toUpperCase()); setPreview(null); setError('') }}
++            onKeyDown={e => e.key === 'Enter' && handleVerify()}
++          />
++          <button
++            onClick={handleVerify}
++            disabled={verifying || !code.trim()}
++            className="px-4 py-2 rounded-xl bg-stone-800 text-white text-sm font-medium hover:bg-stone-700 disabled:opacity-50 transition shrink-0"
++          >
++            {verifying ? '验证中…' : '验证'}
++          </button>
++        </div>
++        <p className="text-xs text-stone-400 mt-1">验证只做预览，不会核销；确认结算时才会真正使用。</p>
+       </div>
+ 
++      {/* 优惠预览 */}
++      {preview && (
++        <div className="bg-terracotta/5 border border-terracotta/20 rounded-xl px-4 py-3 mb-4 text-sm space-y-1.5">
++          <div className="flex justify-between">
++            <span className="text-stone-500">优惠内容</span>
++            <span className="font-medium text-terracotta">{preview.description}</span>
++          </div>
++          <div className="flex justify-between">
++            <span className="text-stone-500">优惠金额</span>
++            <span className="font-medium text-terracotta">−{money(preview.discountGbp)}</span>
++          </div>
++        </div>
++      )}
++
+       <div className="mb-4">
+         <label className="block text-xs text-stone-400 mb-1">备注（可选）</label>
+-        <textarea rows={2} className={inputCls + ' resize-none'} placeholder="如：微信支付、现金、已抹零…"
++        <textarea rows={2} className={inputCls + ' resize-none'} placeholder="如：微信支付、现金…"
+           value={note} onChange={e => setNote(e.target.value)} />
+       </div>
+ 
+@@ -482,6 +603,11 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+ 
+       {error && <p className="text-sm text-red-500 mb-3">{error}</p>}
+ 
++      <div className="bg-stone-50 rounded-xl px-4 py-3 mb-4 flex items-center justify-between">
++        <span className="text-sm font-semibold text-stone-600">最终应收</span>
++        <span className="text-xl font-bold text-terracotta">{money(finalGbp)}</span>
++      </div>
++
+       <button
+         onClick={handleSettle}
+         disabled={saving}
+diff --git a/app/api/admin/coupons/route.ts b/app/api/admin/coupons/route.ts
+new file mode 100644
+index 0000000..902735b
+--- /dev/null
++++ b/app/api/admin/coupons/route.ts
+@@ -0,0 +1,128 @@
++// GET  /api/admin/coupons  — 优惠券列表（分页 + 搜索 + 状态筛选 + 简单统计）
++// POST /api/admin/coupons  — 批量生成优惠券
++import { NextRequest, NextResponse } from 'next/server'
++import { createAdminClient } from '@/lib/supabase/admin'
++import { createClient } from '@/lib/supabase/server'
++import { londonEndOfDayToUtcIso, validateGenerateInput } from '@/lib/coupon/coupon'
++import { generateCouponCodes } from '@/lib/coupon/code'
++
++const DEFAULT_PAGE_SIZE = 50
++const MAX_PAGE_SIZE     = 200
++const STATUS_FILTERS    = ['all', 'unused', 'redeemed', 'expired'] as const
++type StatusFilter = typeof STATUS_FILTERS[number]
++
++// ── 列表 ────────────────────────────────────────────────────────────────────
++
++export async function GET(request: NextRequest) {
++  const supabase = await createClient()
++  const { data: { user } } = await supabase.auth.getUser()
++  if (!user) return NextResponse.json({ error: '未授权' }, { status: 401 })
++
++  const { searchParams } = new URL(request.url)
++  const statusParam = searchParams.get('status') ?? 'all'
++  const status = (STATUS_FILTERS as readonly string[]).includes(statusParam)
++    ? statusParam as StatusFilter
++    : 'all'
++  const search   = (searchParams.get('search') ?? '').trim().toUpperCase()
++  const page     = Math.max(1, parseInt(searchParams.get('page') ?? '1', 10) || 1)
++  const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(searchParams.get('pageSize') ?? String(DEFAULT_PAGE_SIZE), 10) || DEFAULT_PAGE_SIZE))
++
++  const now   = new Date().toISOString()
++  const admin = createAdminClient()
++
++  let query = admin
++    .from('coupons')
++    .select('*', { count: 'exact' })
++    .order('created_at', { ascending: false })
++
++  if (search) query = query.ilike('code', `%${search}%`)
++
++  if (status === 'unused') {
++    query = query.is('redeemed_at', null).or(`expires_at.is.null,expires_at.gte.${now}`)
++  } else if (status === 'redeemed') {
++    query = query.not('redeemed_at', 'is', null)
++  } else if (status === 'expired') {
++    query = query.is('redeemed_at', null).lt('expires_at', now)
++  }
++
++  const from = (page - 1) * pageSize
++  const { data, error, count } = await query.range(from, from + pageSize - 1)
++
++  if (error) {
++    console.error('[GET /api/admin/coupons]', error.message)
++    return NextResponse.json({ error: '读取优惠券失败，请重试' }, { status: 500 })
++  }
++
++  // 简单统计（不受分页/筛选影响，覆盖全表）
++  const [totalRes, redeemedRes, expiredRes] = await Promise.all([
++    admin.from('coupons').select('*', { count: 'exact', head: true }),
++    admin.from('coupons').select('*', { count: 'exact', head: true }).not('redeemed_at', 'is', null),
++    admin.from('coupons').select('*', { count: 'exact', head: true }).is('redeemed_at', null).lt('expires_at', now),
++  ])
++
++  const total    = totalRes.count    ?? 0
++  const redeemed = redeemedRes.count ?? 0
++  const expired  = expiredRes.count  ?? 0
++  const available = Math.max(0, total - redeemed - expired)
++
++  return NextResponse.json({
++    coupons:   data ?? [],
++    page,
++    pageSize,
++    total:     count ?? 0,
++    totalPages: Math.max(1, Math.ceil((count ?? 0) / pageSize)),
++    stats:     { total, available, redeemed, expired },
++  })
++}
++
++// ── 生成 ────────────────────────────────────────────────────────────────────
++
++export async function POST(request: NextRequest) {
++  const supabase = await createClient()
++  const { data: { user } } = await supabase.auth.getUser()
++  if (!user) return NextResponse.json({ error: '未授权' }, { status: 401 })
++
++  let body: { discountType?: unknown; discountValue?: unknown; expiresOn?: unknown; quantity?: unknown }
++  try { body = await request.json() } catch {
++    return NextResponse.json({ error: '请求格式错误' }, { status: 400 })
++  }
++
++  const validation = validateGenerateInput(body)
++  if (!validation.ok) return NextResponse.json({ error: validation.error }, { status: 400 })
++  const { discountType, discountValue, expiresOn, quantity } = validation.value
++
++  let expiresAt: string | null = null
++  if (expiresOn) {
++    expiresAt = londonEndOfDayToUtcIso(expiresOn)
++    if (!expiresAt) return NextResponse.json({ error: '截止日期格式不正确' }, { status: 400 })
++  }
++
++  const admin    = createAdminClient()
++  const createdBy = user.email ?? user.id
++
++  // 随机码碰撞概率极低，但仍以数据库唯一约束兜底：冲突时换一批重试
++  for (let attempt = 0; attempt < 3; attempt++) {
++    const codes = generateCouponCodes(quantity)
++    const { data, error } = await admin
++      .from('coupons')
++      .insert(codes.map(code => ({
++        code,
++        discount_type:  discountType,
++        discount_value: discountValue,
++        expires_at:     expiresAt,
++        created_by:     createdBy,
++      })))
++      .select()
++
++    if (!error) {
++      return NextResponse.json({ coupons: data ?? [], generated: data?.length ?? 0 }, { status: 201 })
++    }
++    if (error.code !== '23505') {
++      console.error('[POST /api/admin/coupons]', error.message)
++      return NextResponse.json({ error: '生成优惠券失败，请重试' }, { status: 500 })
++    }
++  }
++
++  console.error('[POST /api/admin/coupons] 优惠码重复，重试后仍失败')
++  return NextResponse.json({ error: '生成优惠券失败，请重试' }, { status: 500 })
++}
+diff --git a/app/api/admin/coupons/validate/route.ts b/app/api/admin/coupons/validate/route.ts
+new file mode 100644
+index 0000000..b7bb5fa
+--- /dev/null
++++ b/app/api/admin/coupons/validate/route.ts
+@@ -0,0 +1,30 @@
++// POST /api/admin/coupons/validate — 优惠券预验证（只预览，不核销）
++import { NextRequest, NextResponse } from 'next/server'
++import { createAdminClient } from '@/lib/supabase/admin'
++import { createClient } from '@/lib/supabase/server'
++import { loadSettlementContext } from '@/lib/coupon/service'
++import { computeSettlement } from '@/lib/coupon/coupon'
++
++export async function POST(request: NextRequest) {
++  const supabase = await createClient()
++  const { data: { user } } = await supabase.auth.getUser()
++  if (!user) return NextResponse.json({ error: '未授权' }, { status: 401 })
++
++  let body: { code?: string; sessionId?: string }
++  try { body = await request.json() } catch {
++    return NextResponse.json({ error: '请求格式错误' }, { status: 400 })
++  }
++
++  const sessionId = body.sessionId?.trim()
++  if (!sessionId) return NextResponse.json({ error: '缺少计时订单号' }, { status: 400 })
++
++  const admin = createAdminClient()
++  const ctx   = await loadSettlementContext(admin, sessionId, body.code)
++  if (!ctx.ok) return NextResponse.json({ error: ctx.error }, { status: ctx.status })
++
++  // 不锁定、不核销：仅返回服务端计算的优惠预览
++  const result = computeSettlement(ctx.context.session, ctx.context.coupon)
++  if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 })
++
++  return NextResponse.json({ preview: result.preview })
++}
+diff --git a/app/api/admin/timers/[id]/route.ts b/app/api/admin/timers/[id]/route.ts
+index 000033a..08ca3c8 100644
+--- a/app/api/admin/timers/[id]/route.ts
++++ b/app/api/admin/timers/[id]/route.ts
+@@ -5,8 +5,10 @@ import { createAdminClient } from '@/lib/supabase/admin'
+ import { createClient } from '@/lib/supabase/server'
+ import { calcBillingMinutes, calcBill } from '@/lib/timer/pricing'
+ import { resolveActiveSeatCodeFromValue } from '@/lib/timer/selfService'
++import { computeSettlement } from '@/lib/coupon/coupon'
++import { loadSettlementContext, mapRpcError } from '@/lib/coupon/service'
+ 
+-type Action = 'start' | 'pause' | 'resume' | 'stop' | 'settle' | 'update_table'
++type Action = 'start' | 'pause' | 'resume' | 'stop' | 'settle' | 'unsettle' | 'update_table'
+ 
+ export async function GET(
+   _req: NextRequest,
+@@ -46,7 +48,11 @@ export async function DELETE(
+     .eq('session_id', id)
+ 
+   if (error) {
+-    console.error('[DELETE /api/admin/timers]', error)
++    console.error('[DELETE /api/admin/timers]', error.message)
++    // 已核销优惠券的订单受外键约束保护（coupons.redeemed_session_id → ON DELETE RESTRICT）
++    if (error.code === '23503') {
++      return NextResponse.json({ error: '该订单已核销优惠券，请先撤销结算再删除' }, { status: 409 })
++    }
+     return NextResponse.json({ error: '删除失败' }, { status: 500 })
+   }
+ 
+@@ -62,10 +68,11 @@ export async function PATCH(
+   if (!user) return NextResponse.json({ error: '未授权' }, { status: 401 })
+ 
+   const { id }   = await params
+-  const body     = await request.json() as { action: Action; actual_amount_gbp?: number; actual_amount_cny?: number; settlement_note?: string; table_number?: string }
++  // 注意：结算金额一律由服务端计算，客户端传入的 actual_amount_gbp / 折扣字段会被忽略
++  const body     = await request.json() as { action: Action; coupon_code?: string; settlement_note?: string; table_number?: string }
+   const { action } = body
+ 
+-  if (!['start', 'pause', 'resume', 'stop', 'settle', 'update_table'].includes(action)) {
++  if (!['start', 'pause', 'resume', 'stop', 'settle', 'unsettle', 'update_table'].includes(action)) {
+     return NextResponse.json({ error: '无效操作' }, { status: 400 })
+   }
+ 
+@@ -98,35 +105,32 @@ export async function PATCH(
+     }
+     return NextResponse.json({ session: updated })
+   }
+-  if (session.status === 'completed' && action !== 'settle') {
++  if (session.status === 'completed' && action !== 'settle' && action !== 'unsettle') {
+     return NextResponse.json({ error: '计时已结束' }, { status: 409 })
+   }
+ 
+   const now    = new Date()
+   let update: Record<string, unknown> = {}
+ 
+-  // ── 结算 ────────────────────────────────────────────────────────────────────
++  // ── 结算（服务端计算金额 + 同一事务内核销优惠券）─────────────────────────────
+   if (action === 'settle') {
+-    const actualGbp = body.actual_amount_gbp ?? session.amount_gbp
+-    update = {
+-      is_settled:        true,
+-      actual_amount_gbp: actualGbp,
+-      actual_amount_cny: body.actual_amount_cny ?? null,
+-      settlement_note:   body.settlement_note   ?? null,
+-      settled_at:        now.toISOString(),
+-      settled_by:        user.email ?? user.id,
+-    }
+-
+-    const { data: updated, error: updateErr } = await admin
+-      .from('timer_sessions')
+-      .update(update)
+-      .eq('session_id', id)
+-      .select()
+-      .single()
+-
+-    if (updateErr) {
+-      console.error('[settle /api/admin/timers]', updateErr)
+-      return NextResponse.json({ error: '结算失败' }, { status: 500 })
++    const ctx = await loadSettlementContext(admin, id, body.coupon_code)
++    if (!ctx.ok) return NextResponse.json({ error: ctx.error }, { status: ctx.status })
++
++    const computed = computeSettlement(ctx.context.session, ctx.context.coupon)
++    if (!computed.ok) return NextResponse.json({ error: computed.error }, { status: 400 })
++
++    const { data: settled, error: rpcErr } = await admin.rpc('settle_timer_session', {
++      p_session_id:            id,
++      p_settled_by:            user.email ?? user.id,
++      p_settlement_note:       body.settlement_note ?? null,
++      p_coupon_code:           computed.preview.couponCode,
++      p_discount_amount_pence: computed.preview.discountAmountPence,
++    })
++
++    if (rpcErr) {
++      console.error('[settle /api/admin/timers]', rpcErr.message)
++      return NextResponse.json({ error: mapRpcError(rpcErr.message) }, { status: 409 })
+     }
+ 
+     // 如果关联了预约，自动标记为已完成
+@@ -139,7 +143,22 @@ export async function PATCH(
+         .in('status', ['confirmed', 'payment_pending'])
+     }
+ 
+-    return NextResponse.json({ session: updated })
++    return NextResponse.json({ session: settled, preview: computed.preview })
++  }
++
++  // ── 撤销结算（同一事务内恢复优惠券）─────────────────────────────────────────
++  if (action === 'unsettle') {
++    const { data: unsettled, error: rpcErr } = await admin.rpc('unsettle_timer_session', {
++      p_session_id: id,
++    })
++
++    if (rpcErr) {
++      console.error('[unsettle /api/admin/timers]', rpcErr.message)
++      return NextResponse.json({ error: mapRpcError(rpcErr.message) }, { status: 409 })
++    }
++
++    // 关联预约的状态保持不动（撤销结算不回退预约）
++    return NextResponse.json({ session: unsettled })
+   }
+ 
+   if (action === 'start') {
+diff --git a/components/admin/Sidebar.tsx b/components/admin/Sidebar.tsx
+index e105ef3..fecf51e 100644
+--- a/components/admin/Sidebar.tsx
++++ b/components/admin/Sidebar.tsx
+@@ -3,7 +3,7 @@
+ import { useState } from 'react'
+ import { useRouter } from 'next/navigation'
+ import Link from 'next/link'
+-import { LayoutDashboard, CalendarDays, Settings2, ImageIcon, Menu, X, LogOut, Timer } from 'lucide-react'
++import { LayoutDashboard, CalendarDays, Settings2, ImageIcon, Menu, X, LogOut, Timer, TicketPercent } from 'lucide-react'
+ import { cn } from '@/lib/utils'
+ import { createClient } from '@/lib/supabase/client'
+ 
+@@ -11,6 +11,7 @@ const navItems = [
+   { href: '/dashboard',          icon: LayoutDashboard, label: '概览' },
+   { href: '/dashboard/bookings', icon: CalendarDays,    label: '预约管理' },
+   { href: '/dashboard/timers',   icon: Timer,           label: '拼豆计时' },
++  { href: '/dashboard/coupons',  icon: TicketPercent,   label: '优惠券' },
+   { href: '/dashboard/slots',    icon: Settings2,       label: 'Slot 配置' },
+   { href: '/dashboard/gallery',  icon: ImageIcon,       label: '作品图库' },
+ ]
+diff --git a/lib/coupon/code.ts b/lib/coupon/code.ts
+new file mode 100644
+index 0000000..1bda983
+--- /dev/null
++++ b/lib/coupon/code.ts
+@@ -0,0 +1,24 @@
++// 服务端随机优惠码生成（Node crypto，安全随机源）
++// 仅在 API 路由中使用，不进入浏览器包
++
++import { randomInt } from 'node:crypto'
++import { COUPON_CODE_LENGTH, COUPON_CODE_PREFIX } from './coupon.ts'
++
++// 排除易混淆字符：0 / O、1 / I
++export const COUPON_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
++
++/** 生成一张优惠码，格式：TD + 8 位大写字母数字 */
++export function generateCouponCode(): string {
++  let suffix = ''
++  for (let i = 0; i < COUPON_CODE_LENGTH; i++) {
++    suffix += COUPON_CODE_ALPHABET[randomInt(COUPON_CODE_ALPHABET.length)]
++  }
++  return `${COUPON_CODE_PREFIX}${suffix}`
++}
++
++/** 批量生成互不重复的优惠码（同批次内去重） */
++export function generateCouponCodes(quantity: number): string[] {
++  const codes = new Set<string>()
++  while (codes.size < quantity) codes.add(generateCouponCode())
++  return [...codes]
++}
+diff --git a/lib/coupon/coupon.ts b/lib/coupon/coupon.ts
+new file mode 100644
+index 0000000..d21c347
+--- /dev/null
++++ b/lib/coupon/coupon.ts
+@@ -0,0 +1,302 @@
++// ============================================================
++// 优惠券：类型、状态判定与优惠计算（纯函数，可在浏览器/服务端/测试中复用）
++// 规则见 PRD《Tangdouren 优惠券生成与核销系统》第 5、6 节
++// 金额一律换算为「便士整数」计算，避免浮点误差
++// ============================================================
++
++import { TIMER_PRICING } from '../timer/pricing.ts'
++
++export type DiscountType = 'fixed_amount' | 'percentage_off' | 'time_minutes'
++export type CouponStatus = 'unused' | 'redeemed' | 'expired'
++
++export const COUPON_CODE_PREFIX       = 'TD'
++export const COUPON_CODE_LENGTH       = 8      // 去掉易混淆字符后随机位数
++export const MIN_BILLING_MINUTES      = 60     // 首小时不可减免
++export const TIME_COUPON_STEP_MINUTES = 30     // 时长券必须是 30 分钟的整数倍
++export const MAX_GENERATE_QUANTITY    = 500    // 单次生成上限
++export const MIN_GENERATE_QUANTITY    = 1
++
++/** 每 30 分钟续时价格（£11.99/h ÷ 2），时长券按此统一抵扣 */
++export const CONTINUATION_BLOCK_GBP = TIMER_PRICING.continuationPerHourGbp / 2
++
++export const COUPON_STATUS_LABELS: Record<CouponStatus, string> = {
++  unused:   '未使用',
++  redeemed: '已使用',
++  expired:  '已过期',
++}
++
++// ── 金额换算 ────────────────────────────────────────────────────────────────
++
++/** 英镑 → 便士整数（四舍五入到分） */
++export function toPence(gbp: number): number {
++  return Math.round(gbp * 100)
++}
++
++/** 便士整数 → 英镑数值 */
++export function fromPence(pence: number): number {
++  return pence / 100
++}
++
++/** 统一的优惠码输入规范化：去首尾空格 + 转大写 */
++export function normalizeCouponCode(raw: unknown): string {
++  return typeof raw === 'string' ? raw.trim().toUpperCase() : ''
++}
++
++// ── 状态判定 ────────────────────────────────────────────────────────────────
++
++export interface CouponStateFields {
++  redeemed_at: string | null
++  expires_at:  string | null
++}
++
++/** 状态判定顺序：已核销 → 已过期 → 未使用（有效期动态判断，不落库） */
++export function couponStatus(coupon: CouponStateFields, now: Date = new Date()): CouponStatus {
++  if (coupon.redeemed_at) return 'redeemed'
++  if (coupon.expires_at && new Date(coupon.expires_at).getTime() < now.getTime()) return 'expired'
++  return 'unused'
++}
++
++/** 优惠内容文案，例如「减 £2.00」「15% OFF」「减免 30 分钟」 */
++export function describeDiscount(type: DiscountType, value: number): string {
++  if (type === 'fixed_amount')   return `减 £${value.toFixed(2)}`
++  if (type === 'percentage_off') return `${trimNumber(value)}% OFF`
++  return `减免 ${trimNumber(value)} 分钟`
++}
++
++function trimNumber(value: number): string {
++  return Number.isInteger(value) ? String(value) : String(parseFloat(value.toFixed(2)))
++}
++
++// ── 伦敦时区日期处理 ────────────────────────────────────────────────────────
++
++const LONDON_TZ = 'Europe/London'
++
++/** 某个 UTC 时刻下，伦敦比 UTC 快多少毫秒（BST 时为正） */
++function londonOffsetMs(date: Date): number {
++  const dtf = new Intl.DateTimeFormat('en-GB', {
++    timeZone: LONDON_TZ, hour12: false,
++    year: 'numeric', month: '2-digit', day: '2-digit',
++    hour: '2-digit', minute: '2-digit', second: '2-digit',
++  })
++  const parts = dtf.formatToParts(date)
++  const get   = (type: string) => Number(parts.find(p => p.type === type)?.value ?? '0')
++  const asUtc = Date.UTC(
++    get('year'), get('month') - 1, get('day'),
++    get('hour'), get('minute'), get('second'),
++  )
++  return asUtc - date.getTime()
++}
++
++/** 伦敦当地日期（YYYY-MM-DD） */
++export function londonToday(now: Date = new Date()): string {
++  return new Intl.DateTimeFormat('en-CA', {
++    timeZone: LONDON_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
++  }).format(now)
++}
++
++/**
++ * 把「截止日期」（伦敦当地 YYYY-MM-DD）转换成 UTC 时刻，结束于当日 23:59:59。
++ * 永久有效时调用方应传 null。
++ */
++export function londonEndOfDayToUtcIso(dateStr: string): string | null {
++  if (!isValidDateString(dateStr)) return null
++  const [year, month, day] = dateStr.split('-').map(Number)
++  // 先按「伦敦墙上时间 23:59:59」当作 UTC 得到近似时刻，再用该时刻的伦敦偏移校正
++  const probe = new Date(Date.UTC(year, month - 1, day, 23, 59, 59))
++  return new Date(probe.getTime() - londonOffsetMs(probe)).toISOString()
++}
++
++/** 判断 YYYY-MM-DD 是否是合法日历日期 */
++export function isValidDateString(dateStr: string): boolean {
++  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr)
++  if (!m) return false
++  const year = Number(m[1]), month = Number(m[2]), day = Number(m[3])
++  const d = new Date(Date.UTC(year, month - 1, day))
++  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day
++}
++
++// ── 生成参数校验 ────────────────────────────────────────────────────────────
++
++export interface GenerateCouponInput {
++  discountType:  DiscountType
++  discountValue: number
++  expiresOn:     string | null   // 伦敦当地 YYYY-MM-DD，null = 永久有效
++  quantity:      number
++}
++
++export type GenerateValidation =
++  | { ok: true;  value: GenerateCouponInput }
++  | { ok: false; error: string }
++
++export function validateGenerateInput(raw: {
++  discountType?: unknown
++  discountValue?: unknown
++  expiresOn?: unknown
++  quantity?: unknown
++}, now: Date = new Date()): GenerateValidation {
++  const type = raw.discountType
++  if (type !== 'fixed_amount' && type !== 'percentage_off' && type !== 'time_minutes') {
++    return { ok: false, error: '请选择优惠类型' }
++  }
++
++  const value = typeof raw.discountValue === 'number'
++    ? raw.discountValue
++    : parseFloat(String(raw.discountValue ?? ''))
++  if (!Number.isFinite(value) || value <= 0) {
++    return { ok: false, error: '优惠值必须大于 0' }
++  }
++
++  if (type === 'fixed_amount') {
++    if (value > 9999.99) return { ok: false, error: '固定金额过大' }
++    if (toPence(value) / 100 !== parseFloat(value.toFixed(2))) {
++      return { ok: false, error: '固定金额最多保留两位小数' }
++    }
++  }
++
++  if (type === 'percentage_off' && value >= 100) {
++    return { ok: false, error: '折扣百分比必须大于 0 且小于 100' }
++  }
++
++  if (type === 'time_minutes') {
++    if (!Number.isInteger(value) || value % TIME_COUPON_STEP_MINUTES !== 0) {
++      return { ok: false, error: `时长减免必须是 ${TIME_COUPON_STEP_MINUTES} 分钟的整数倍` }
++    }
++  }
++
++  let expiresOn: string | null = null
++  const rawExpires = typeof raw.expiresOn === 'string' && raw.expiresOn.trim() !== '' ? raw.expiresOn.trim() : null
++  if (rawExpires) {
++    if (!isValidDateString(rawExpires)) return { ok: false, error: '截止日期格式不正确' }
++    if (rawExpires < londonToday(now)) return { ok: false, error: '截止日期不能早于今天' }
++    expiresOn = rawExpires
++  }
++
++  const rawQuantity = raw.quantity
++  const quantity = typeof rawQuantity === 'number'
++    ? rawQuantity
++    : (typeof rawQuantity === 'string' && /^\d+$/.test(rawQuantity.trim())
++        ? parseInt(rawQuantity.trim(), 10)
++        : NaN)
++  if (!Number.isInteger(quantity) || quantity < MIN_GENERATE_QUANTITY || quantity > MAX_GENERATE_QUANTITY) {
++    return { ok: false, error: `生成数量必须是 ${MIN_GENERATE_QUANTITY} 到 ${MAX_GENERATE_QUANTITY} 之间的整数` }
++  }
++
++  return { ok: true, value: { discountType: type, discountValue: value, expiresOn, quantity } }
++}
++
++// ── 优惠计算 / 预验证 ───────────────────────────────────────────────────────
++
++export interface CouponForPreview {
++  code:            string
++  discount_type:   DiscountType
++  discount_value:  number
++  expires_at:      string | null
++  redeemed_at:     string | null
++}
++
++export interface SessionForPreview {
++  session_id:      string
++  status:          string
++  is_settled:      boolean
++  billing_minutes: number | null
++  amount_gbp:      number | null
++}
++
++export interface SettlementPreview {
++  sessionId:           string
++  couponCode:          string | null
++  discountType:        DiscountType | null
++  discountValue:       number | null
++  description:         string
++  preDiscountGbp:      number
++  discountGbp:         number
++  finalGbp:            number
++  discountAmountPence: number
++}
++
++export type PreviewResult =
++  | { ok: true;  preview: SettlementPreview }
++  | { ok: false; error: string }
++
++/**
++ * 服务端唯一的优惠计算入口。
++ * 传入订单与优惠券记录，返回原价 / 优惠金额 / 最终应收（英镑）以及时长券的优惠后计费分钟。
++ * coupon 为 null 时表示不使用优惠券。
++ */
++export function computeSettlement(
++  session: SessionForPreview,
++  coupon: CouponForPreview | null,
++  now: Date = new Date(),
++): PreviewResult {
++  if (session.status !== 'completed') {
++    return { ok: false, error: '请先结束计时再结算' }
++  }
++  if (session.is_settled) {
++    return { ok: false, error: '该订单已结算' }
++  }
++  if (session.amount_gbp === null || session.amount_gbp === undefined) {
++    return { ok: false, error: '订单金额缺失，无法结算' }
++  }
++
++  const prePence = toPence(session.amount_gbp)
++
++  // 无券
++  if (!coupon) {
++    return {
++      ok: true,
++      preview: {
++        sessionId:           session.session_id,
++        couponCode:          null,
++        discountType:        null,
++        discountValue:       null,
++        description:         '不使用优惠券',
++        preDiscountGbp:      fromPence(prePence),
++        discountGbp:         0,
++        finalGbp:            fromPence(prePence),
++        discountAmountPence: 0,
++      },
++    }
++  }
++
++  const status = couponStatus(coupon, now)
++  if (status === 'redeemed') return { ok: false, error: '该优惠券已被使用' }
++  if (status === 'expired')  return { ok: false, error: '该优惠券已过期' }
++
++  let discountPence: number
++
++  if (coupon.discount_type === 'fixed_amount') {
++    // 优惠金额 = min(固定抵扣金额, 系统原价)
++    discountPence = Math.min(toPence(coupon.discount_value), prePence)
++
++  } else if (coupon.discount_type === 'percentage_off') {
++    // 优惠金额 = 系统原价 × 减免百分比 ÷ 100（按分四舍五入）
++    discountPence = Math.round(prePence * coupon.discount_value / 100)
++
++  } else {
++    // 时长券：首小时不可减免；按「每 30 分钟续时价」统一抵扣，不重新计算套餐
++    const billingMinutes = session.billing_minutes
++    if (billingMinutes === null || billingMinutes === undefined || billingMinutes <= MIN_BILLING_MINUTES) {
++      return { ok: false, error: '当前订单没有可减免的续时时长' }
++    }
++    const blocks = coupon.discount_value / TIME_COUPON_STEP_MINUTES
++    discountPence = Math.min(toPence(blocks * CONTINUATION_BLOCK_GBP), prePence)
++  }
++
++  if (discountPence > prePence) discountPence = prePence
++  const finalPence = prePence - discountPence
++
++  return {
++    ok: true,
++    preview: {
++      sessionId:           session.session_id,
++      couponCode:          coupon.code,
++      discountType:        coupon.discount_type,
++      discountValue:       coupon.discount_value,
++      description:         describeDiscount(coupon.discount_type, coupon.discount_value),
++      preDiscountGbp:      fromPence(prePence),
++      discountGbp:         fromPence(discountPence),
++      finalGbp:            fromPence(finalPence),
++      discountAmountPence: discountPence,
++    },
++  }
++}
+diff --git a/lib/coupon/service.ts b/lib/coupon/service.ts
+new file mode 100644
+index 0000000..cae3b31
+--- /dev/null
++++ b/lib/coupon/service.ts
+@@ -0,0 +1,81 @@
++// ============================================================
++// 优惠券服务端辅助：读取结算上下文、预验证、错误文案映射
++// 由 /api/admin/coupons/validate 与 /api/admin/timers/[id]（settle / unsettle）共用
++// ============================================================
++
++import type { SupabaseClient } from '@supabase/supabase-js'
++import {
++  normalizeCouponCode,
++  type CouponForPreview, type SessionForPreview,
++} from './coupon.ts'
++
++export interface SettlementContext {
++  session: SessionForPreview & { booking_id: string | null }
++  coupon:  CouponForPreview | null
++}
++
++export type ContextResult =
++  | { ok: true;  context: SettlementContext }
++  | { ok: false; status: number; error: string }
++
++/**
++ * 读取订单与优惠码（如有）。只做读取与存在性校验，
++ * 优惠与金额判定交给 computeSettlement。
++ */
++export async function loadSettlementContext(
++  admin: SupabaseClient,
++  sessionId: string,
++  rawCode: string | null | undefined,
++): Promise<ContextResult> {
++  const { data: session, error: sessionErr } = await admin
++    .from('timer_sessions')
++    .select('session_id, status, is_settled, billing_minutes, amount_gbp, booking_id')
++    .eq('session_id', sessionId)
++    .maybeSingle()
++
++  if (sessionErr) {
++    console.error('[coupon] 读取计时订单失败', sessionErr.message)
++    return { ok: false, status: 500, error: '读取订单失败，请重试' }
++  }
++  if (!session) {
++    return { ok: false, status: 404, error: '计时订单不存在' }
++  }
++
++  const code = normalizeCouponCode(rawCode)
++  if (!code) {
++    return { ok: true, context: { session, coupon: null } }
++  }
++
++  const { data: coupon, error: couponErr } = await admin
++    .from('coupons')
++    .select('code, discount_type, discount_value, expires_at, redeemed_at')
++    .eq('code', code)
++    .maybeSingle()
++
++  if (couponErr) {
++    console.error('[coupon] 读取优惠券失败', couponErr.message)
++    return { ok: false, status: 500, error: '读取优惠券失败，请重试' }
++  }
++  if (!coupon) {
++    return { ok: false, status: 404, error: '优惠码不存在' }
++  }
++
++  return { ok: true, context: { session, coupon } }
++}
++
++/** 把数据库 RPC 抛出的标记转换成中文提示，不向前端暴露原始数据库错误 */
++export function mapRpcError(message: string | undefined | null): string {
++  const raw = message ?? ''
++  if (raw.includes('COUPON_ALREADY_USED'))         return '该优惠券已被使用'
++  if (raw.includes('COUPON_EXPIRED'))              return '该优惠券已过期'
++  if (raw.includes('COUPON_NOT_FOUND'))            return '优惠码不存在'
++  if (raw.includes('SESSION_ALREADY_HAS_COUPON'))  return '该订单已使用过优惠券'
++  if (raw.includes('SESSION_ALREADY_SETTLED'))     return '该订单已结算'
++  if (raw.includes('SESSION_NOT_SETTLED'))         return '该订单尚未结算'
++  if (raw.includes('SESSION_NOT_COMPLETED'))       return '请先结束计时再结算'
++  if (raw.includes('SESSION_NOT_FOUND'))           return '计时订单不存在'
++  if (raw.includes('COUPON_TIME_NOT_APPLICABLE'))  return '当前订单没有可减免的续时时长'
++  if (raw.includes('COUPON_DISCOUNT_MISMATCH'))    return '优惠金额校验未通过，请重新验证优惠码'
++  if (raw.includes('COUPON_REDEMPTION_MISMATCH'))  return '优惠券核销状态异常，请刷新页面后重试'
++  return '操作失败，请重试'
++}
+diff --git a/supabase/migrations/013_coupons.sql b/supabase/migrations/013_coupons.sql
+new file mode 100644
+index 0000000..fe10e56
+--- /dev/null
++++ b/supabase/migrations/013_coupons.sql
+@@ -0,0 +1,292 @@
++-- ============================================================
++-- 优惠券生成与核销系统（MVP v1.0）
++-- 1) 新表 coupons
++-- 2) timer_sessions 优惠快照字段
++-- 3) 结算核销 / 撤销结算 原子事务函数
++-- 说明：金额一律由服务端计算，核销与结算在同一事务内完成。
++-- ============================================================
++
++-- ── 1. coupons ───────────────────────────────────────────────────────────────
++
++CREATE TABLE IF NOT EXISTS coupons (
++  coupon_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
++  code                TEXT NOT NULL,                 -- 大写存储
++  discount_type       TEXT NOT NULL,                 -- fixed_amount | percentage_off | time_minutes
++  discount_value      NUMERIC(10,2) NOT NULL,        -- 金额(£) / 减免百分比 / 减免分钟数
++  expires_at          TIMESTAMPTZ NULL,              -- NULL = 永久有效
++  redeemed_at         TIMESTAMPTZ NULL,
++  redeemed_by         TEXT NULL,
++  redeemed_session_id TEXT NULL REFERENCES timer_sessions(session_id) ON DELETE RESTRICT,
++  created_by          TEXT NOT NULL,
++  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++-- 优惠类型
++ALTER TABLE coupons DROP CONSTRAINT IF EXISTS coupons_discount_type_check;
++ALTER TABLE coupons ADD CONSTRAINT coupons_discount_type_check
++  CHECK (discount_type IN ('fixed_amount', 'percentage_off', 'time_minutes'));
++
++-- 优惠值：> 0；百分比 < 100；时长券必须是 30 分钟的整数倍
++ALTER TABLE coupons DROP CONSTRAINT IF EXISTS coupons_discount_value_check;
++ALTER TABLE coupons ADD CONSTRAINT coupons_discount_value_check
++  CHECK (
++    discount_value > 0
++    AND (discount_type <> 'percentage_off' OR discount_value < 100)
++    AND (
++      discount_type <> 'time_minutes'
++      OR (discount_value = trunc(discount_value) AND mod(discount_value::bigint, 30) = 0)
++    )
++  );
++
++-- 优惠码统一大写
++ALTER TABLE coupons DROP CONSTRAINT IF EXISTS coupons_code_upper_check;
++ALTER TABLE coupons ADD CONSTRAINT coupons_code_upper_check CHECK (code = upper(code));
++
++-- 核销字段要么全空，要么成组出现
++ALTER TABLE coupons DROP CONSTRAINT IF EXISTS coupons_redemption_consistency_check;
++ALTER TABLE coupons ADD CONSTRAINT coupons_redemption_consistency_check
++  CHECK (
++    (redeemed_at IS NULL     AND redeemed_session_id IS NULL     AND redeemed_by IS NULL)
++    OR
++    (redeemed_at IS NOT NULL AND redeemed_session_id IS NOT NULL AND redeemed_by IS NOT NULL)
++  );
++
++CREATE UNIQUE INDEX IF NOT EXISTS idx_coupons_code          ON coupons(code);
++CREATE UNIQUE INDEX IF NOT EXISTS idx_coupons_redeemed_session
++  ON coupons(redeemed_session_id) WHERE redeemed_session_id IS NOT NULL;
++CREATE INDEX IF NOT EXISTS idx_coupons_created_at  ON coupons(created_at DESC);
++CREATE INDEX IF NOT EXISTS idx_coupons_expires_at  ON coupons(expires_at);
++CREATE INDEX IF NOT EXISTS idx_coupons_redeemed_at ON coupons(redeemed_at);
++
++-- RLS：仅登录管理员可操作（实际 API 使用 service role client）
++ALTER TABLE coupons ENABLE ROW LEVEL SECURITY;
++DROP POLICY IF EXISTS "Admin all coupons" ON coupons;
++CREATE POLICY "Admin all coupons" ON coupons
++  FOR ALL USING (auth.role() = 'authenticated');
++
++-- ── 2. timer_sessions 结算与优惠快照字段 ──────────────────────────────────────
++
++ALTER TABLE timer_sessions
++  ADD COLUMN IF NOT EXISTS coupon_id                  UUID NULL REFERENCES coupons(coupon_id) ON DELETE RESTRICT,
++  ADD COLUMN IF NOT EXISTS coupon_code_snapshot       TEXT NULL,
++  ADD COLUMN IF NOT EXISTS discount_type_snapshot     TEXT NULL,
++  ADD COLUMN IF NOT EXISTS discount_value_snapshot    NUMERIC(10,2) NULL,
++  ADD COLUMN IF NOT EXISTS discount_amount_gbp        NUMERIC(8,2) NOT NULL DEFAULT 0,
++  ADD COLUMN IF NOT EXISTS pre_discount_amount_gbp    NUMERIC(8,2) NULL,
++  ADD COLUMN IF NOT EXISTS discounted_billing_minutes INTEGER NULL;
++
++CREATE INDEX IF NOT EXISTS idx_timer_sessions_coupon ON timer_sessions(coupon_id);
++
++-- ── 3. 原子结算 + 核销 ────────────────────────────────────────────────────────
++-- 无券结算与用券结算共用此函数：核销与结算发生在同一事务，任一失败全部回滚。
++-- 金额由服务端（TypeScript 计价函数）计算后传入，函数内对可独立推导的部分
++-- 用数据库自身的数据重新核对，不信任客户端传来的任何金额。
++--   固定抵扣：优惠金额必须等于 min(券面金额, 订单原价)
++--   百分比  ：优惠金额必须等于 round(订单原价 pence × 百分比 / 100)
++--   时长减免：计费时长必须超过 60 分钟，且优惠金额落在 [0, 原价] 区间
++--             （半小时续时单价保留在 lib/timer/pricing.ts，避免在 SQL 里重复业务常量）
++
++DROP FUNCTION IF EXISTS public.settle_timer_session(TEXT, TEXT, TEXT, TEXT, INTEGER, INTEGER);
++DROP FUNCTION IF EXISTS public.settle_timer_session(TEXT, TEXT, TEXT, TEXT, INTEGER);
++
++CREATE OR REPLACE FUNCTION public.settle_timer_session(
++  p_session_id            TEXT,
++  p_settled_by            TEXT,
++  p_settlement_note       TEXT    DEFAULT NULL,
++  p_coupon_code           TEXT    DEFAULT NULL,
++  p_discount_amount_pence INTEGER DEFAULT NULL
++) RETURNS JSONB
++LANGUAGE plpgsql
++SECURITY DEFINER
++SET search_path = public
++AS $$
++DECLARE
++  v_session     timer_sessions%ROWTYPE;
++  v_coupon      coupons%ROWTYPE;
++  v_code        TEXT;
++  v_pre_pence   INTEGER;
++  v_expect      INTEGER;
++  v_final_pence INTEGER;
++BEGIN
++  -- 1. 锁定订单
++  SELECT * INTO v_session FROM timer_sessions WHERE session_id = p_session_id FOR UPDATE;
++  IF NOT FOUND THEN
++    RAISE EXCEPTION 'SESSION_NOT_FOUND' USING ERRCODE = 'P0001';
++  END IF;
++  IF v_session.status <> 'completed' THEN
++    RAISE EXCEPTION 'SESSION_NOT_COMPLETED' USING ERRCODE = 'P0001';
++  END IF;
++  IF v_session.is_settled THEN
++    RAISE EXCEPTION 'SESSION_ALREADY_SETTLED' USING ERRCODE = 'P0001';
++  END IF;
++
++  v_pre_pence := COALESCE(ROUND(v_session.amount_gbp * 100)::INTEGER, 0);
++
++  -- 2. 无券结算
++  IF p_coupon_code IS NULL OR btrim(p_coupon_code) = '' THEN
++    UPDATE timer_sessions SET
++      is_settled                 = TRUE,
++      actual_amount_gbp          = v_session.amount_gbp,
++      settlement_note            = p_settlement_note,
++      settled_at                 = NOW(),
++      settled_by                 = p_settled_by,
++      coupon_id                  = NULL,
++      coupon_code_snapshot       = NULL,
++      discount_type_snapshot     = NULL,
++      discount_value_snapshot    = NULL,
++      discount_amount_gbp        = 0,
++      pre_discount_amount_gbp    = v_session.amount_gbp,
++      discounted_billing_minutes = NULL
++    WHERE session_id = p_session_id
++    RETURNING * INTO v_session;
++
++    RETURN to_jsonb(v_session);
++  END IF;
++
++  v_code := upper(btrim(p_coupon_code));
++
++  -- 3. 锁定优惠券并校验状态
++  SELECT * INTO v_coupon FROM coupons WHERE code = v_code FOR UPDATE;
++  IF NOT FOUND THEN
++    RAISE EXCEPTION 'COUPON_NOT_FOUND' USING ERRCODE = 'P0001';
++  END IF;
++  IF v_coupon.redeemed_at IS NOT NULL THEN
++    RAISE EXCEPTION 'COUPON_ALREADY_USED' USING ERRCODE = 'P0001';
++  END IF;
++  IF v_coupon.expires_at IS NOT NULL AND v_coupon.expires_at < NOW() THEN
++    RAISE EXCEPTION 'COUPON_EXPIRED' USING ERRCODE = 'P0001';
++  END IF;
++  IF EXISTS (
++    SELECT 1 FROM coupons
++     WHERE redeemed_session_id = p_session_id AND coupon_id <> v_coupon.coupon_id
++  ) THEN
++    RAISE EXCEPTION 'SESSION_ALREADY_HAS_COUPON' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 4. 复核服务端计算出的优惠金额
++  IF p_discount_amount_pence IS NULL THEN
++    RAISE EXCEPTION 'COUPON_DISCOUNT_MISSING' USING ERRCODE = 'P0001';
++  END IF;
++
++  IF v_coupon.discount_type = 'fixed_amount' THEN
++    v_expect := LEAST(ROUND(v_coupon.discount_value * 100)::INTEGER, v_pre_pence);
++    IF p_discount_amount_pence <> v_expect THEN
++      RAISE EXCEPTION 'COUPON_DISCOUNT_MISMATCH' USING ERRCODE = 'P0001';
++    END IF;
++
++  ELSIF v_coupon.discount_type = 'percentage_off' THEN
++    v_expect := ROUND(v_pre_pence * v_coupon.discount_value / 100)::INTEGER;
++    IF p_discount_amount_pence <> v_expect THEN
++      RAISE EXCEPTION 'COUPON_DISCOUNT_MISMATCH' USING ERRCODE = 'P0001';
++    END IF;
++
++  ELSE  -- time_minutes
++    -- 时长券：首小时不可减免；优惠金额按「每 30 分钟续时价」由服务端统一计算。
++    -- 具体单价常量保留在 lib/timer/pricing.ts（唯一来源），此处只校验结构性约束：
++    -- 计费时长必须超过 60 分钟，且优惠金额落在 [0, 原价] 区间（见下方通用校验）。
++    IF v_session.billing_minutes IS NULL OR v_session.billing_minutes <= 60 THEN
++      RAISE EXCEPTION 'COUPON_TIME_NOT_APPLICABLE' USING ERRCODE = 'P0001';
++    END IF;
++  END IF;
++
++  v_final_pence := v_pre_pence - p_discount_amount_pence;
++  IF p_discount_amount_pence < 0 OR v_final_pence < 0 THEN
++    RAISE EXCEPTION 'COUPON_DISCOUNT_MISMATCH' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 5. 写入订单结算与快照
++  UPDATE timer_sessions SET
++    is_settled                 = TRUE,
++    actual_amount_gbp          = ROUND(v_final_pence / 100.0, 2),
++    settlement_note            = p_settlement_note,
++    settled_at                 = NOW(),
++    settled_by                 = p_settled_by,
++    coupon_id                  = v_coupon.coupon_id,
++    coupon_code_snapshot       = v_coupon.code,
++    discount_type_snapshot     = v_coupon.discount_type,
++    discount_value_snapshot    = v_coupon.discount_value,
++    discount_amount_gbp        = ROUND(p_discount_amount_pence / 100.0, 2),
++    pre_discount_amount_gbp    = v_session.amount_gbp,
++    discounted_billing_minutes = NULL   -- v1.0 时长券不重算计费时长，该列保留备用
++  WHERE session_id = p_session_id;
++
++  -- 6. 核销优惠券
++  UPDATE coupons SET
++    redeemed_at         = NOW(),
++    redeemed_by         = p_settled_by,
++    redeemed_session_id = p_session_id
++  WHERE coupon_id = v_coupon.coupon_id;
++
++  SELECT * INTO v_session FROM timer_sessions WHERE session_id = p_session_id;
++  RETURN to_jsonb(v_session);
++END;
++$$;
++
++-- ── 4. 撤销结算（并恢复优惠券）───────────────────────────────────────────────
++
++CREATE OR REPLACE FUNCTION public.unsettle_timer_session(
++  p_session_id TEXT
++) RETURNS JSONB
++LANGUAGE plpgsql
++SECURITY DEFINER
++SET search_path = public
++AS $$
++DECLARE
++  v_session timer_sessions%ROWTYPE;
++  v_coupon  coupons%ROWTYPE;
++BEGIN
++  SELECT * INTO v_session FROM timer_sessions WHERE session_id = p_session_id FOR UPDATE;
++  IF NOT FOUND THEN
++    RAISE EXCEPTION 'SESSION_NOT_FOUND' USING ERRCODE = 'P0001';
++  END IF;
++  IF NOT v_session.is_settled THEN
++    RAISE EXCEPTION 'SESSION_NOT_SETTLED' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 恢复优惠券（仅当该券确实由本订单核销）
++  IF v_session.coupon_id IS NOT NULL THEN
++    SELECT * INTO v_coupon FROM coupons WHERE coupon_id = v_session.coupon_id FOR UPDATE;
++    IF FOUND THEN
++      IF v_coupon.redeemed_session_id IS DISTINCT FROM p_session_id OR v_coupon.redeemed_at IS NULL THEN
++        RAISE EXCEPTION 'COUPON_REDEMPTION_MISMATCH' USING ERRCODE = 'P0001';
++      END IF;
++      UPDATE coupons SET
++        redeemed_at         = NULL,
++        redeemed_by         = NULL,
++        redeemed_session_id = NULL
++      WHERE coupon_id = v_coupon.coupon_id;
++    END IF;
++  END IF;
++
++  UPDATE timer_sessions SET
++    is_settled                 = FALSE,
++    actual_amount_gbp          = NULL,
++    actual_amount_cny          = NULL,
++    settlement_note            = NULL,
++    settled_at                 = NULL,
++    settled_by                 = NULL,
++    coupon_id                  = NULL,
++    coupon_code_snapshot       = NULL,
++    discount_type_snapshot     = NULL,
++    discount_value_snapshot    = NULL,
++    discount_amount_gbp        = 0,
++    pre_discount_amount_gbp    = NULL,
++    discounted_billing_minutes = NULL
++  WHERE session_id = p_session_id
++  RETURNING * INTO v_session;
++
++  RETURN to_jsonb(v_session);
++END;
++$$;
++
++-- ── 5. 权限：仅 service role 可执行（避免前端直接调用 RPC）────────────────────
++
++DO $$
++BEGIN
++  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
++    EXECUTE 'REVOKE ALL ON FUNCTION public.settle_timer_session(TEXT, TEXT, TEXT, TEXT, INTEGER) FROM PUBLIC';
++    EXECUTE 'GRANT EXECUTE ON FUNCTION public.settle_timer_session(TEXT, TEXT, TEXT, TEXT, INTEGER) TO service_role';
++    EXECUTE 'REVOKE ALL ON FUNCTION public.unsettle_timer_session(TEXT) FROM PUBLIC';
++    EXECUTE 'GRANT EXECUTE ON FUNCTION public.unsettle_timer_session(TEXT) TO service_role';
++  END IF;
++END $$;
+diff --git a/tests/coupon.test.ts b/tests/coupon.test.ts
+new file mode 100644
+index 0000000..d600eba
+--- /dev/null
++++ b/tests/coupon.test.ts
+@@ -0,0 +1,252 @@
++import assert from 'node:assert/strict'
++import test from 'node:test'
++import { calcBill } from '../lib/timer/pricing.ts'
++import {
++  computeSettlement,
++  couponStatus,
++  describeDiscount,
++  isValidDateString,
++  londonEndOfDayToUtcIso,
++  londonToday,
++  normalizeCouponCode,
++  toPence,
++  validateGenerateInput,
++  type CouponForPreview,
++  type SessionForPreview,
++} from '../lib/coupon/coupon.ts'
++import { COUPON_CODE_ALPHABET, generateCouponCode, generateCouponCodes } from '../lib/coupon/code.ts'
++
++// ── 测试辅助 ────────────────────────────────────────────────────────────────
++
++function session(billingMinutes: number, opts: Partial<SessionForPreview> = {}): SessionForPreview {
++  return {
++    session_id:      'PB-20260915-001',
++    status:          'completed',
++    is_settled:      false,
++    billing_minutes: billingMinutes,
++    amount_gbp:      calcBill(billingMinutes).totalGbp,
++    ...opts,
++  }
++}
++
++function coupon(type: CouponForPreview['discount_type'], value: number, opts: Partial<CouponForPreview> = {}): CouponForPreview {
++  return {
++    code:           'TDTESTCODE',
++    discount_type:  type,
++    discount_value: value,
++    expires_at:     null,
++    redeemed_at:    null,
++    ...opts,
++  }
++}
++
++function preview(s: SessionForPreview, c: CouponForPreview | null, now?: Date) {
++  const res = computeSettlement(s, c, now)
++  assert.equal(res.ok, true, res.ok ? '' : res.error)
++  if (!res.ok) throw new Error('unreachable')
++  return res.preview
++}
++
++function failure(s: SessionForPreview, c: CouponForPreview | null, now?: Date): string {
++  const res = computeSettlement(s, c, now)
++  assert.equal(res.ok, false)
++  if (res.ok) throw new Error('unreachable')
++  return res.error
++}
++
++// ── 11.1 计算测试 ───────────────────────────────────────────────────────────
++
++test('固定抵扣：£13.99 订单使用 £2 券后应收 £11.99', () => {
++  const p = preview(session(60), coupon('fixed_amount', 2))
++  assert.equal(p.preDiscountGbp, 13.99)
++  assert.equal(p.discountGbp, 2)
++  assert.equal(p.finalGbp, 11.99)
++})
++
++test('固定抵扣大于原价时最终金额为 £0.00', () => {
++  const p = preview(session(60), coupon('fixed_amount', 20))
++  assert.equal(p.preDiscountGbp, 13.99)
++  assert.equal(p.discountGbp, 13.99)
++  assert.equal(p.finalGbp, 0)
++  assert.equal(p.discountAmountPence, 1399)
++})
++
++test('百分比折扣：£25.99 使用 15% OFF 按便士四舍五入为 £3.90，应收 £22.09', () => {
++  const p = preview(session(150), coupon('percentage_off', 15))
++  assert.equal(p.preDiscountGbp, 25.99)
++  assert.equal(p.discountGbp, 3.90)
++  assert.equal(p.finalGbp, 22.09)
++})
++
++test('百分比折扣不会超过原价（例如 99% OFF）', () => {
++  const p = preview(session(60), coupon('percentage_off', 99))
++  assert.equal(p.discountGbp, 13.85)
++  assert.equal(p.finalGbp, 0.14)
++})
++
++test('时长券：60 分钟订单不可使用', () => {
++  assert.equal(failure(session(60), coupon('time_minutes', 30)), '当前订单没有可减免的续时时长')
++})
++
++test('时长券：90 分钟订单用 30 分钟券，统一减半小时续时价 £6.00', () => {
++  const p = preview(session(90), coupon('time_minutes', 30))
++  assert.equal(p.preDiscountGbp, 19.98)
++  assert.equal(p.discountGbp, 6)
++  assert.equal(p.finalGbp, 13.98)
++})
++
++test('时长券：150 分钟订单用 30 分钟券，同样减 £6.00（不重新跑套餐计价）', () => {
++  const p = preview(session(150), coupon('time_minutes', 30))
++  assert.equal(p.preDiscountGbp, 25.99)   // 2.5h 套餐价
++  assert.equal(p.discountGbp, 6)
++  assert.equal(p.finalGbp, 19.99)
++})
++
++test('时长券：240 分钟订单用 30 分钟券，同样减 £6.00', () => {
++  const p = preview(session(240), coupon('time_minutes', 30))
++  assert.equal(p.preDiscountGbp, 39.99)   // 4h 套餐价
++  assert.equal(p.discountGbp, 6)
++  assert.equal(p.finalGbp, 33.99)
++})
++
++test('时长券：60 分钟券减 £11.99（两倍半小时续时价）', () => {
++  const p = preview(session(150), coupon('time_minutes', 60))
++  assert.equal(p.discountGbp, 11.99)
++  assert.equal(p.finalGbp, 14)
++})
++
++test('时长券：优惠金额不会超过订单原价', () => {
++  const p = preview(session(90), coupon('time_minutes', 300))   // 10×£5.995 ≈ £59.95
++  assert.equal(p.discountGbp, 19.98)
++  assert.equal(p.finalGbp, 0)
++})
++
++test('无券结算时最终应收等于系统原价', () => {
++  const p = preview(session(150), null)
++  assert.equal(p.couponCode, null)
++  assert.equal(p.discountGbp, 0)
++  assert.equal(p.finalGbp, 25.99)
++})
++
++test('未完成计时的订单不能结算', () => {
++  assert.equal(failure(session(60, { status: 'running' }), null), '请先结束计时再结算')
++})
++
++test('已结算订单不能重复结算', () => {
++  assert.equal(failure(session(60, { is_settled: true }), null), '该订单已结算')
++})
++
++// ── 11.2 状态测试 ───────────────────────────────────────────────────────────
++
++test('永久有效券（expires_at 为空）可验证', () => {
++  assert.equal(couponStatus(coupon('fixed_amount', 2)), 'unused')
++})
++
++test('截止日当天伦敦时间 23:59 前仍可验证', () => {
++  // 2026-07-15 伦敦当地 23:59:59 = 22:59:59Z
++  const expiresAt = londonEndOfDayToUtcIso('2026-07-15')
++  assert.equal(expiresAt, '2026-07-15T22:59:59.000Z')
++  const before = new Date('2026-07-15T22:59:00.000Z')
++  assert.equal(couponStatus({ redeemed_at: null, expires_at: expiresAt }, before), 'unused')
++  const after = new Date('2026-07-15T23:00:00.000Z')
++  assert.equal(couponStatus({ redeemed_at: null, expires_at: expiresAt }, after), 'expired')
++})
++
++test('冬季（GMT）截止日换算不带夏令时偏移', () => {
++  assert.equal(londonEndOfDayToUtcIso('2026-12-15'), '2026-12-15T23:59:59.000Z')
++})
++
++test('过期券被拒绝', () => {
++  const expiresAt = londonEndOfDayToUtcIso('2026-07-15')
++  const now       = new Date('2026-07-16T10:00:00.000Z')
++  assert.equal(failure(session(60), coupon('fixed_amount', 2, { expires_at: expiresAt }), now), '该优惠券已过期')
++})
++
++test('已使用券被拒绝', () => {
++  const c = coupon('fixed_amount', 2, { redeemed_at: '2026-07-10T10:00:00.000Z' })
++  assert.equal(failure(session(60), c), '该优惠券已被使用')
++})
++
++test('优惠码输入忽略大小写与首尾空格', () => {
++  assert.equal(normalizeCouponCode('  tdabcd1234 '), 'TDABCD1234')
++  assert.equal(normalizeCouponCode(null), '')
++})
++
++test('优惠文案', () => {
++  assert.equal(describeDiscount('fixed_amount', 2), '减 £2.00')
++  assert.equal(describeDiscount('percentage_off', 15), '15% OFF')
++  assert.equal(describeDiscount('time_minutes', 30), '减免 30 分钟')
++})
++
++// ── 生成参数校验 ────────────────────────────────────────────────────────────
++
++const TODAY = new Date('2026-09-15T12:00:00.000Z')
++
++test('时长券只接受 30 分钟的整数倍', () => {
++  const bad = validateGenerateInput({ discountType: 'time_minutes', discountValue: 45, expiresOn: null, quantity: 1 }, TODAY)
++  assert.equal(bad.ok, false)
++  if (!bad.ok) assert.equal(bad.error, '时长减免必须是 30 分钟的整数倍')
++
++  const good = validateGenerateInput({ discountType: 'time_minutes', discountValue: 90, expiresOn: null, quantity: 1 }, TODAY)
++  assert.equal(good.ok, true)
++})
++
++test('百分比折扣必须在 0 与 100 之间', () => {
++  for (const value of [0, -5, 100, 120]) {
++    const res = validateGenerateInput({ discountType: 'percentage_off', discountValue: value, expiresOn: null, quantity: 1 }, TODAY)
++    assert.equal(res.ok, false, `${value} 应被拒绝`)
++  }
++  const ok = validateGenerateInput({ discountType: 'percentage_off', discountValue: 15, expiresOn: null, quantity: 1 }, TODAY)
++  assert.equal(ok.ok, true)
++})
++
++test('固定金额最多两位小数且必须大于 0', () => {
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2.005, expiresOn: null, quantity: 1 }, TODAY).ok, false)
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 0, expiresOn: null, quantity: 1 }, TODAY).ok, false)
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2.5, expiresOn: null, quantity: 1 }, TODAY).ok, true)
++})
++
++test('生成数量必须是 1 到 500 之间的整数', () => {
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: null, quantity: 0 }, TODAY).ok, false)
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: null, quantity: 501 }, TODAY).ok, false)
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: null, quantity: 2.5 }, TODAY).ok, false)
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: null, quantity: 500 }, TODAY).ok, true)
++})
++
++test('截止日期必须是合法日期且不能早于今天（伦敦时间）', () => {
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: '2026-02-30', quantity: 1 }, TODAY).ok, false)
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: 'not-a-date', quantity: 1 }, TODAY).ok, false)
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: '2026-09-01', quantity: 1 }, TODAY).ok, false)
++  assert.equal(validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: '2026-09-15', quantity: 1 }, TODAY).ok, true)
++})
++
++test('日期与伦敦当日判断', () => {
++  assert.equal(isValidDateString('2026-09-15'), true)
++  assert.equal(isValidDateString('2026-13-01'), false)
++  assert.equal(londonToday(new Date('2026-09-15T22:30:00.000Z')), '2026-09-15')
++  assert.equal(londonToday(new Date('2026-09-15T23:30:00.000Z')), '2026-09-16') // 伦敦已跨日
++})
++
++// ── 优惠码生成 ──────────────────────────────────────────────────────────────
++
++test('优惠码格式：TD 前缀 + 8 位，且不含易混淆字符', () => {
++  const code = generateCouponCode()
++  assert.match(code, /^TD[A-Z2-9]{8}$/)
++  assert.equal(code.length, 10)
++  for (const ch of code.slice(2)) {
++    assert.ok(COUPON_CODE_ALPHABET.includes(ch), `${ch} 不在字符集中`)
++  }
++  assert.equal(/[0O1I]/.test(code), false)
++})
++
++test('批量生成的优惠码互不重复', () => {
++  const codes = generateCouponCodes(500)
++  assert.equal(codes.length, 500)
++  assert.equal(new Set(codes).size, 500)
++})
++
++test('便士换算按分四舍五入', () => {
++  assert.equal(toPence(13.99), 1399)
++  assert.equal(toPence(19.985), 1999)
++  assert.equal(toPence(0.005), 1)
++})

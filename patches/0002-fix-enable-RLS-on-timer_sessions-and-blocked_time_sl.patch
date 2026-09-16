@@ -1,0 +1,47 @@
+From c3dea249875e2dfc8146f800451c1a1003c839b3 Mon Sep 17 00:00:00 2001
+From: Zwei-0122 <325088970+Zwei-0122@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 01:04:58 +0100
+Subject: [PATCH 2/4] fix: enable RLS on timer_sessions and blocked_time_slots
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+迁移 008 与 011 建表时未启用 Row Level Security，而 Supabase 默认会把
+public schema 新表的全部权限授予 anon。前端使用的 publishable key 是
+公开的（打进浏览器 bundle），因此任何人可直接读取、篡改、删除计时订单
+与封禁时段数据，无需登录。
+
+应用访问这两张表全部走 service role（lib/supabase/admin.ts 的
+createAdminClient），service role 天然绕过 RLS，因此本次只启用 RLS、
+不建任何策略，即 anon / authenticated 完全无权访问，应用行为不变。
+
+已在 Supabase 测试项目实测：匿名读/写/删全部被封住；服务端全量验证
+（优惠券 57 项断言）依旧全部通过。
+---
+ supabase/migrations/014_enable_rls.sql | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+ create mode 100644 supabase/migrations/014_enable_rls.sql
+
+diff --git a/supabase/migrations/014_enable_rls.sql b/supabase/migrations/014_enable_rls.sql
+new file mode 100644
+index 0000000..c776557
+--- /dev/null
++++ b/supabase/migrations/014_enable_rls.sql
+@@ -0,0 +1,17 @@
++-- ============================================================
++-- 修复：为 timer_sessions 与 blocked_time_slots 启用 RLS
++--
++-- 背景：008 与 011 建表时未启用 Row Level Security，而 Supabase 默认
++--       会把 public schema 新表的全部权限授予 anon。前端使用的
++--       publishable key 是公开的（打进浏览器 bundle），因此任何人
++--       都能直接用该 key 读取、篡改、删除计时订单与封禁时段数据。
++--       该问题已通过 publishable key 实测复现确认。
++--
++-- 说明：应用访问这两张表时全部走 service role（lib/supabase/admin.ts
++--       的 createAdminClient），service role 天然绕过 RLS，因此这里
++--       只启用 RLS、不建任何策略即 anon / authenticated 完全无权访问，
++--       应用行为保持不变。
++-- ============================================================
++
++ALTER TABLE timer_sessions     ENABLE ROW LEVEL SECURITY;
++ALTER TABLE blocked_time_slots ENABLE ROW LEVEL SECURITY;
